@@ -21,7 +21,6 @@ import {
   QrCode,
   ScanLine,
   Mic,
-  Square,
   KeyRound,
   MoreVertical,
   Smile,
@@ -34,9 +33,14 @@ import {
   Eye,
   RefreshCw,
   X,
+  Settings,
+  LogIn,
+  Maximize2,
+  Palette,
 } from 'lucide-react';
 import {
   CryptoPacketLog,
+  DeviceRole,
   EncryptedMessage,
   FileAttachmentMeta,
   LocalNodeIdentity,
@@ -71,6 +75,15 @@ import {
   flushOutgoingDataChannelQueue,
   sendOverReliableDataChannel,
 } from './utils/webrtcPeerEngine';
+import {
+  MilitaryThemeId,
+  MILITARY_THEMES,
+  applyMilitaryThemeToDOM,
+  usePWAAndFullscreen,
+  tacticalBackgroundDaemon,
+  BackgroundKeepAliveStatus,
+  sendBackgroundSystemNotification,
+} from './utils/pwaAndKeepAliveEngine';
 import { ManualSdpModal } from './components/ManualSdpModal';
 import {
   TacticalMediaStreamModal,
@@ -79,6 +92,7 @@ import {
 import { AdminProvisioningModal } from './components/AdminProvisioningModal';
 import { OperativeOnboardingModal } from './components/OperativeOnboardingModal';
 import { VoiceNotePlayer } from './components/VoiceNotePlayer';
+import { TacticalSettingsModal } from './components/TacticalSettingsModal';
 
 interface LoopbackTunnel {
   localPc: RTCPeerConnection;
@@ -161,6 +175,30 @@ export default function App() {
     fingerprint: 'MENGINISIALISASI KUNCI...',
     sessionStartedAt: Date.now(),
   });
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(true);
+
+  // Military Theme & Mobile Settings / Background Keep-Alive State
+  const [activeTheme, setActiveTheme] = useState<MilitaryThemeId>('tactical-black');
+  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+  const [soundAlertEnabled, setSoundAlertEnabled] = useState<boolean>(true);
+  const soundAlertEnabledRef = useRef<boolean>(true);
+  soundAlertEnabledRef.current = soundAlertEnabled;
+  const [wsSignalConnected, setWsSignalConnected] = useState<boolean>(false);
+  const [keepAliveStatus, setKeepAliveStatus] = useState<BackgroundKeepAliveStatus>(
+    tacticalBackgroundDaemon.getStatus()
+  );
+
+  // Fullscreen & PWA Hook for Mobile HP Installation
+  const {
+    isInstallable,
+    isInstalled,
+    isIOS,
+    isFullscreen,
+    autoFullscreenOnTap,
+    setAutoFullscreenOnTap,
+    toggleFullscreen,
+    promptInstall,
+  } = usePWAAndFullscreen();
 
   const [contacts, setContacts] = useState<TacticalContact[]>(INITIAL_TACTICAL_CONTACTS);
   // Single-column screen navigation: null = Home List View, string = Active Chat Room View
@@ -168,7 +206,7 @@ export default function App() {
   const openChatPeerIdRef = useRef<string | null>(null);
   openChatPeerIdRef.current = openChatPeerId;
 
-  // Bottom Navigation Bar (4 Tabs): 'chat' | 'status' | 'groups' | 'calls'
+  // Bottom Navigation Bar: 'chat' | 'status' | 'groups' | 'calls'
   const [activeBottomTab, setActiveBottomTab] = useState<'chat' | 'status' | 'groups' | 'calls'>('chat');
 
   const [messagesByPeer, setMessagesByPeer] = useState<Record<string, EncryptedMessage[]>>({});
@@ -281,6 +319,70 @@ export default function App() {
     }
   }, [messagesByPeer, openChatPeerId]);
 
+  // Apply selected Military Color Theme to DOM CSS Variables & Meta Theme-Color
+  useEffect(() => {
+    applyMilitaryThemeToDOM(activeTheme);
+  }, [activeTheme]);
+
+  // Activate Background Keep-Alive Daemon so APK stays operating when user opens other apps on HP
+  useEffect(() => {
+    tacticalBackgroundDaemon.start();
+    const unsubStatus = tacticalBackgroundDaemon.subscribe((st) => {
+      setKeepAliveStatus(st);
+    });
+
+    // Background WebWorker Heartbeat: keeps WebSocket & WebRTC ICE channels alive when switching apps
+    const unsubHeartbeat = tacticalBackgroundDaemon.onHeartbeat(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'node:ping',
+              peerId: localIdentityRef.current.peerId,
+              timestamp: Date.now(),
+            })
+          );
+        } catch {
+          // Ignore
+        }
+      }
+      // Check active WebRTC live tunnels and recover if ICE disconnected while in background
+      livePeerTunnelsRef.current.forEach((tunnel, pid) => {
+        if (
+          tunnel.pc &&
+          (tunnel.pc.iceConnectionState === 'disconnected' ||
+            tunnel.pc.iceConnectionState === 'failed')
+        ) {
+          if (typeof tunnel.pc.restartIce === 'function') {
+            tunnel.pc.restartIce();
+          }
+          flushOutgoingDataChannelQueue(tunnel, () => {});
+        }
+        // Keep data channel warm
+        if (tunnel.dc && tunnel.dc.readyState === 'open' && tunnel.outgoingPacketQueue.length > 0) {
+          flushOutgoingDataChannelQueue(tunnel, () => {});
+        }
+        void pid;
+      });
+    });
+
+    // Ensure Web Audio & MediaSession keep-alive starts on first user gesture on mobile
+    const handleFirstUserGesture = () => {
+      if (tacticalBackgroundDaemon.getStatus().enabled) {
+        tacticalBackgroundDaemon.ensureAudioKeepAlive();
+      }
+    };
+    window.addEventListener('pointerdown', handleFirstUserGesture, { once: true, passive: true });
+    window.addEventListener('touchstart', handleFirstUserGesture, { once: true, passive: true });
+
+    return () => {
+      unsubStatus();
+      unsubHeartbeat();
+      window.removeEventListener('pointerdown', handleFirstUserGesture);
+      window.removeEventListener('touchstart', handleFirstUserGesture);
+    };
+  }, []);
+
   // Helper to get avatar initials
   const getInitials = (name: string) => {
     const words = name
@@ -353,6 +455,15 @@ export default function App() {
           : msg.kind === 'document'
           ? `📄 Dokumen: ${msg.fileMeta?.fileName || 'Berkas'}`
           : msg.plaintext;
+
+      if (isIncoming) {
+        void sendBackgroundSystemNotification(
+          `SILENT LINK • ${msg.senderCallsign || 'Personel P2P'}`,
+          previewText,
+          soundAlertEnabledRef.current,
+          'message'
+        );
+      }
 
       setContacts((prev) => {
         const exists = prev.some((c) => c.peerId === peerId);
@@ -1484,11 +1595,13 @@ export default function App() {
 
         ws.onopen = () => {
           if (!isMounted) return;
+          setWsSignalConnected(true);
           sendNodeRegistration(localIdentityRef.current);
         };
 
         ws.onclose = () => {
           if (!isMounted) return;
+          setWsSignalConnected(false);
           reconnectTimer = window.setTimeout(connectSignalingWebSocket, 2000);
         };
 
@@ -1723,14 +1836,21 @@ export default function App() {
 
             // 5. Live Multi-Client Voice Call & Video Call Invitation
             if (msg.type === 'call:invite' && msg.fromPeerId) {
+              const cType = msg.callType === 'video' ? 'video' : 'voice';
               setIncomingCallInvite({
                 fromPeerId: msg.fromPeerId,
                 callerName: msg.callerName || `Personel ${msg.fromPeerId}`,
                 callerNrp: msg.callerNrp || msg.fromPeerId.slice(-6),
                 callerRank: msg.callerRank || 'Personel Aktif',
-                callType: msg.callType === 'video' ? 'video' : 'voice',
+                callType: cType,
                 timestamp: Date.now(),
               });
+              void sendBackgroundSystemNotification(
+                `PANGGILAN ${cType === 'video' ? 'VIDEO' : 'SUARA'} P2P MASUK`,
+                `${msg.callerName || msg.fromPeerId} (${msg.callerRank || 'Personel'}) memanggil...`,
+                soundAlertEnabledRef.current,
+                'call'
+              );
               setCallHistory((prev) => [
                 {
                   id: `CALL-${Date.now()}`,
@@ -1739,7 +1859,7 @@ export default function App() {
                   rank: msg.callerRank || 'Personel Aktif',
                   nrp: msg.callerNrp || msg.fromPeerId.slice(-6),
                   timestamp: Date.now(),
-                  callType: msg.callType === 'video' ? 'video' : 'voice',
+                  callType: cType,
                   direction: 'incoming',
                 },
                 ...prev,
@@ -2090,7 +2210,77 @@ export default function App() {
 
     localIdentityRef.current = adminIdentity;
     setLocalIdentity(adminIdentity);
+    setIsLoggedIn(true);
     sendNodeRegistration(adminIdentity);
+  };
+
+  // Login or Switch Account from Mobile Settings Modal
+  const handleLoginAccount = async (params: {
+    name: string;
+    nrp: string;
+    rank: string;
+    unit: string;
+    role: DeviceRole;
+  }) => {
+    const ecdh = await generateEphemeralECDHKeyPair();
+    const signing =
+      params.role === 'ADMIN'
+        ? await generateAdminSigningKeyPair()
+        : { signingPublicKeyJwk: null, signingPrivateKey: null };
+
+    const cleanNrp = params.nrp.replace(/[^a-zA-Z0-9]/g, '') || '526316';
+    const isDefaultMaster =
+      params.role === 'ADMIN' && cleanNrp === '526316';
+    const suffix = isDefaultMaster
+      ? '0001'
+      : Math.random().toString(36).slice(2, 6).toUpperCase();
+    const peerId =
+      params.role === 'ADMIN'
+        ? `SLK-ADM-${cleanNrp}-${suffix}`
+        : `SLK-ID-${cleanNrp}-${suffix}`;
+
+    const newIdentity: LocalNodeIdentity = {
+      peerId,
+      role: params.role,
+      personnelName: params.name,
+      nrp: cleanNrp,
+      callsign: `${params.name} [${params.role === 'ADMIN' ? 'ADMIN HP' : 'OPERATIVE'}]`,
+      unit: params.unit,
+      rank: params.rank,
+      publicKeyJwk: ecdh.publicKeyJwk,
+      privateKey: ecdh.privateKey,
+      signingPublicKeyJwk: signing.signingPublicKeyJwk,
+      signingPrivateKey: signing.signingPrivateKey,
+      fingerprint: ecdh.fingerprint,
+      sessionStartedAt: Date.now(),
+    };
+
+    localIdentityRef.current = newIdentity;
+    setLocalIdentity(newIdentity);
+    setIsLoggedIn(true);
+    sendNodeRegistration(newIdentity);
+  };
+
+  // Logout Account (Zero-Retention RAM Wipe of Session Keys & Chat History)
+  const handleLogoutAccount = () => {
+    loopbackTunnelsRef.current.forEach((t) => {
+      t.localDc.close();
+      t.localPc.close();
+      t.remotePc.close();
+    });
+    loopbackTunnelsRef.current.clear();
+
+    livePeerTunnelsRef.current.forEach((t) => {
+      if (t.iceRestartTimer) window.clearTimeout(t.iceRestartTimer);
+      t.dc?.close();
+      t.pc?.close();
+    });
+    livePeerTunnelsRef.current.clear();
+    processedMessageIdsRef.current.clear();
+
+    setMessagesByPeer({});
+    setOpenChatPeerId(null);
+    setIsLoggedIn(false);
   };
 
   // Open Chat Room when a chat row is clicked
@@ -2944,11 +3134,29 @@ export default function App() {
   };
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-[#031525] text-[#e9edef] flex flex-col items-center justify-center select-none relative">
+    <div
+      className="h-dvh w-screen overflow-hidden flex flex-col items-center justify-center select-none relative"
+      style={{
+        backgroundColor: 'var(--slk-bg-main)',
+        color: 'var(--slk-text-primary)',
+      }}
+    >
       {/* Main 1-Column Mobile-First WhatsApp Android Dark Mode Container */}
-      <div className="w-full max-w-2xl h-full bg-[#0b141a] md:border-x md:border-[#1f2c34] flex flex-col relative overflow-hidden shadow-2xl">
+      <div
+        className="w-full max-w-2xl h-full md:border-x flex flex-col relative overflow-hidden shadow-2xl"
+        style={{
+          backgroundColor: 'var(--slk-bg-main)',
+          borderColor: 'var(--slk-border)',
+        }}
+      >
         {/* Top Corner Micro Insignia Bar: Left = Logo Petir Super Kecil, Right = Logo TNI AU Super Kecil */}
-        <div className="h-6 shrink-0 px-3 bg-[#070d12] border-b border-white/5 flex items-center justify-between z-30">
+        <div
+          className="h-6 shrink-0 px-3 border-b flex items-center justify-between z-30"
+          style={{
+            backgroundColor: 'var(--slk-bg-card)',
+            borderColor: 'var(--slk-border)',
+          }}
+        >
           {/* Pojok Kiri Atas: Logo Petir Super Kecil */}
           <div className="flex items-center gap-1.5">
             <img
@@ -2961,8 +3169,12 @@ export default function App() {
             </span>
           </div>
 
-          <span className="text-[9px] text-[#8696a0] tracking-widest uppercase hidden sm:inline">
-            SWA BHUWANA PAKSA • SECURE P2P
+          <span
+            className="text-[9px] tracking-widest uppercase truncate px-2"
+            style={{ color: 'var(--slk-text-secondary)' }}
+          >
+            {MILITARY_THEMES[activeTheme].badgeText} •{' '}
+            {keepAliveStatus.enabled ? 'BG-DAEMON ON' : 'P2P E2EE'}
           </span>
 
           {/* Pojok Kanan Atas: Logo TNI AU Super Kecil */}
@@ -2984,7 +3196,13 @@ export default function App() {
         {openChatPeerId && activeContact ? (
           <div className="flex-1 flex flex-col h-full overflow-hidden">
             {/* Chat Room Top App Bar (WhatsApp Android Style) */}
-            <header className="h-15 shrink-0 px-2.5 bg-[#111b21] border-b border-[#1f2c34] flex items-center justify-between gap-2 z-20">
+            <header
+              className="h-15 shrink-0 px-2.5 border-b flex items-center justify-between gap-2 z-20"
+              style={{
+                backgroundColor: 'var(--slk-bg-header)',
+                borderColor: 'var(--slk-border)',
+              }}
+            >
               <div className="flex items-center gap-1.5 min-w-0">
                 <button
                   type="button"
@@ -3011,11 +3229,13 @@ export default function App() {
                     getInitials(activeContact.personnelName)
                   )}
                   <span
-                    className={`w-2.5 h-2.5 rounded-full border-2 border-[#111b21] absolute bottom-0 right-0 ${
-                      activeContact.connectionState === 'CONNECTED'
-                        ? 'bg-[#00f0ff]'
-                        : 'bg-amber-400'
-                    }`}
+                    className="w-2.5 h-2.5 rounded-full border-2 border-[#111b21] absolute bottom-0 right-0"
+                    style={{
+                      backgroundColor:
+                        activeContact.connectionState === 'CONNECTED'
+                          ? 'var(--slk-accent)'
+                          : '#fbbf24',
+                    }}
                   />
                 </div>
 
@@ -3024,13 +3244,19 @@ export default function App() {
                   onClick={() => setShowSecuritySheet(true)}
                   className="min-w-0 pl-1 cursor-pointer"
                 >
-                  <h1 className="text-sm sm:text-base font-semibold text-[#e9edef] truncate leading-tight">
+                  <h1 className="text-sm sm:text-base font-semibold truncate leading-tight">
                     {activeContact.personnelName}
                   </h1>
-                  <p className="text-xs text-[#8696a0] truncate">
+                  <p
+                    className="text-xs truncate"
+                    style={{ color: 'var(--slk-text-secondary)' }}
+                  >
                     {activeContact.rank} · NRP {activeContact.nrp} ·{' '}
-                    <span className="font-mono text-cyan-300">{activeContact.peerId}</span> ·{' '}
-                    <span className="text-[#00f0ff]">
+                    <span className="font-mono" style={{ color: 'var(--slk-accent)' }}>
+                      {activeContact.peerId}
+                    </span>{' '}
+                    ·{' '}
+                    <span style={{ color: 'var(--slk-accent)' }}>
                       {activeContact.connectionState === 'CONNECTED'
                         ? 'P2P Online'
                         : 'Menyambungkan...'}
@@ -3039,12 +3265,12 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Right Icons: Video Call, Voice Call, More Menu */}
+              {/* Right Icons: Video Call, Voice Call, Settings, More Menu */}
               <div className="flex items-center gap-0.5 shrink-0">
                 <button
                   type="button"
                   onClick={() => handleLaunchMediaCall(activeContact, 'video')}
-                  className="min-w-[42px] min-h-[42px] rounded-full flex items-center justify-center text-[#e9edef] hover:bg-white/10 transition-colors"
+                  className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
                   title="Panggilan Video WebRTC P2P"
                 >
                   <Video className="w-5 h-5" />
@@ -3052,15 +3278,23 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => handleLaunchMediaCall(activeContact, 'voice')}
-                  className="min-w-[42px] min-h-[42px] rounded-full flex items-center justify-center text-[#e9edef] hover:bg-white/10 transition-colors"
+                  className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
                   title="Panggilan Suara WebRTC P2P"
                 >
                   <Phone className="w-4.5 h-4.5" />
                 </button>
                 <button
                   type="button"
+                  onClick={() => setIsSettingsOpen(true)}
+                  className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
+                  title="Pengaturan HP & Tema Militer"
+                >
+                  <Settings className="w-5 h-5" style={{ color: 'var(--slk-accent)' }} />
+                </button>
+                <button
+                  type="button"
                   onClick={() => setShowSecuritySheet(true)}
-                  className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#e9edef] hover:bg-white/10 transition-colors"
+                  className="min-w-[38px] min-h-[38px] rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
                   title="Detail Enkripsi & Sesi"
                 >
                   <MoreVertical className="w-5 h-5" />
@@ -3071,9 +3305,16 @@ export default function App() {
             {/* Single Thin Encryption & Live ICE/DataChannel Strip at Top of Chat Room */}
             <div
               onClick={() => setShowSecuritySheet(true)}
-              className="py-1.5 px-3 bg-[#031525]/95 border-b border-cyan-500/20 text-center cursor-pointer hover:bg-[#062038] transition-colors z-10"
+              className="py-1.5 px-3 border-b text-center cursor-pointer transition-colors z-10"
+              style={{
+                backgroundColor: 'var(--slk-bg-card)',
+                borderColor: 'var(--slk-border)',
+              }}
             >
-              <p className="text-[11px] font-medium text-[#00f0ff] tracking-wide truncate">
+              <p
+                className="text-[11px] font-medium tracking-wide truncate"
+                style={{ color: 'var(--slk-accent)' }}
+              >
                 🔒 E2EE AES-256-GCM • ICE: {activeContact.iceState.toUpperCase()} • DC:{' '}
                 {activeContact.dataChannelState.toUpperCase()} (ordered/reliable) • ZERO-RETENTION
               </p>
@@ -3085,9 +3326,14 @@ export default function App() {
               <div className="flex justify-center mb-3">
                 <div
                   onClick={() => setShowSecuritySheet(true)}
-                  className="max-w-md px-3.5 py-2 rounded-xl bg-[#182229]/95 border border-cyan-500/15 text-[11px] text-[#8696a0] text-center leading-relaxed cursor-pointer shadow-xs"
+                  className="max-w-md px-3.5 py-2 rounded-xl border text-[11px] text-center leading-relaxed cursor-pointer shadow-xs"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-card)',
+                    borderColor: 'var(--slk-border)',
+                    color: 'var(--slk-text-secondary)',
+                  }}
                 >
-                  <span className="text-[#00f0ff] font-medium">
+                  <span className="font-medium" style={{ color: 'var(--slk-accent)' }}>
                     Pesan dan panggilan terenkripsi secara ujung-ke-ujung (WebRTC P2P).
                   </span>{' '}
                   Tidak ada seorang pun di luar chat ini yang dapat membaca atau menyimpannya.
@@ -3097,7 +3343,7 @@ export default function App() {
 
               {currentMessages.length === 0 ? (
                 <div className="py-16 text-center space-y-2">
-                  <p className="text-xs text-[#8696a0]">
+                  <p className="text-xs" style={{ color: 'var(--slk-text-secondary)' }}>
                     Belum ada percakapan di memori RAM sesi ini.
                   </p>
                 </div>
@@ -3106,7 +3352,14 @@ export default function App() {
                   if (msg.kind === 'system') {
                     return (
                       <div key={msg.id} className="flex justify-center my-2">
-                        <div className="max-w-md px-3 py-1.5 rounded-lg bg-[#182229] text-[11px] text-[#00f0ff] text-center">
+                        <div
+                          className="max-w-md px-3 py-1.5 rounded-lg text-[11px] text-center border"
+                          style={{
+                            backgroundColor: 'var(--slk-bg-card)',
+                            borderColor: 'var(--slk-border)',
+                            color: 'var(--slk-accent)',
+                          }}
+                        >
                           {msg.plaintext}
                         </div>
                       </div>
@@ -3121,15 +3374,27 @@ export default function App() {
                       className={`flex flex-col ${isOwn ? 'items-end' : 'items-start'}`}
                     >
                       <div
-                        className={`max-w-[85%] sm:max-w-[75%] px-3 py-2 shadow-sm relative ${
+                        className={`max-w-[85%] sm:max-w-[75%] px-3 py-2 shadow-sm relative border ${
                           isOwn
-                            ? 'bg-[#05354c] text-[#e9edef] rounded-2xl rounded-tr-xs border border-cyan-500/20'
-                            : 'bg-[#202c33] text-[#e9edef] rounded-2xl rounded-tl-xs'
+                            ? 'rounded-2xl rounded-tr-xs'
+                            : 'rounded-2xl rounded-tl-xs'
                         }`}
+                        style={{
+                          backgroundColor: isOwn
+                            ? 'var(--slk-bg-bubble-own)'
+                            : 'var(--slk-bg-bubble-peer)',
+                          borderColor: isOwn
+                            ? 'var(--slk-accent-muted)'
+                            : 'var(--slk-border)',
+                          color: 'var(--slk-text-primary)',
+                        }}
                       >
                         {/* Sender Name in Group or Incoming Chat */}
                         {(!isOwn || activeContact.isGroup) && (
-                          <div className="text-xs font-semibold text-[#00f0ff] mb-0.5">
+                          <div
+                            className="text-xs font-semibold mb-0.5"
+                            style={{ color: 'var(--slk-accent)' }}
+                          >
                             {msg.senderCallsign}
                           </div>
                         )}
@@ -3141,21 +3406,28 @@ export default function App() {
 
                         {/* Image Attachment Bubble */}
                         {msg.kind === 'image' && msg.fileMeta && (
-                          <div className="mb-1.5 rounded-xl overflow-hidden bg-[#0b141a] border border-white/10">
+                          <div
+                            className="mb-1.5 rounded-xl overflow-hidden border border-white/10"
+                            style={{ backgroundColor: 'var(--slk-bg-main)' }}
+                          >
                             <img
                               src={msg.fileMeta.dataUrl}
                               alt={msg.fileMeta.fileName}
                               referrerPolicy="no-referrer"
                               className="w-full max-h-64 object-contain"
                             />
-                            <div className="px-2.5 py-1.5 bg-[#111b21] flex items-center justify-between gap-2 text-[11px]">
+                            <div
+                              className="px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px]"
+                              style={{ backgroundColor: 'var(--slk-bg-header)' }}
+                            >
                               <span className="truncate text-slate-300">
                                 {msg.fileMeta.fileName} ({formatFileSize(msg.fileMeta.fileSize)})
                               </span>
                               <a
                                 href={msg.fileMeta.dataUrl}
                                 download={msg.fileMeta.fileName}
-                                className="flex items-center gap-1 text-[#00f0ff] hover:underline shrink-0 font-medium"
+                                className="flex items-center gap-1 hover:underline shrink-0 font-medium"
+                                style={{ color: 'var(--slk-accent)' }}
                               >
                                 <Download className="w-3.5 h-3.5" />
                                 <span>Unduh</span>
@@ -3166,14 +3438,23 @@ export default function App() {
 
                         {/* Document Attachment Bubble */}
                         {msg.kind === 'document' && msg.fileMeta && (
-                          <div className="mb-1.5 p-2.5 rounded-xl bg-[#111b21]/90 border border-white/10 flex items-center justify-between gap-3">
+                          <div
+                            className="mb-1.5 p-2.5 rounded-xl border border-white/10 flex items-center justify-between gap-3"
+                            style={{ backgroundColor: 'var(--slk-bg-header)' }}
+                          >
                             <div className="flex items-center gap-2.5 min-w-0">
-                              <FileText className="w-6 h-6 text-[#00f0ff] shrink-0" />
+                              <FileText
+                                className="w-6 h-6 shrink-0"
+                                style={{ color: 'var(--slk-accent)' }}
+                              />
                               <div className="min-w-0">
                                 <div className="text-xs font-semibold text-slate-100 truncate">
                                   {msg.fileMeta.fileName}
                                 </div>
-                                <div className="text-[11px] text-[#8696a0]">
+                                <div
+                                  className="text-[11px]"
+                                  style={{ color: 'var(--slk-text-secondary)' }}
+                                >
                                   {formatFileSize(msg.fileMeta.fileSize)} · {msg.fileMeta.chunkCount} SCTP Chunks
                                 </div>
                               </div>
@@ -3181,7 +3462,11 @@ export default function App() {
                             <a
                               href={msg.fileMeta.dataUrl}
                               download={msg.fileMeta.fileName}
-                              className="p-2 rounded-full bg-[#202c33] hover:bg-slate-700 text-[#00f0ff] shrink-0"
+                              className="p-2 rounded-full shrink-0"
+                              style={{
+                                backgroundColor: 'var(--slk-bg-input)',
+                                color: 'var(--slk-accent)',
+                              }}
                               title="Simpan Dokumen"
                             >
                               <Download className="w-4 h-4" />
@@ -3189,12 +3474,15 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Message Text & Floating Bottom-Right Time + Double Cyan Checkmarks */}
+                        {/* Message Text & Floating Bottom-Right Time + Double Checkmarks */}
                         <div className="flex flex-wrap items-end justify-end gap-x-2 gap-y-0.5">
-                          <p className="text-sm leading-snug text-[#e9edef] whitespace-pre-wrap break-words flex-1 min-w-[60px]">
+                          <p className="text-sm leading-snug whitespace-pre-wrap break-words flex-1 min-w-[60px]">
                             {msg.plaintext}
                           </p>
-                          <div className="flex items-center gap-1 text-[10px] text-[#8696a0] shrink-0 select-none ml-auto pt-0.5">
+                          <div
+                            className="flex items-center gap-1 text-[10px] shrink-0 select-none ml-auto pt-0.5"
+                            style={{ color: 'var(--slk-text-secondary)' }}
+                          >
                             <span>
                               {new Date(msg.timestamp).toLocaleTimeString('id-ID', {
                                 hour: '2-digit',
@@ -3207,7 +3495,10 @@ export default function App() {
                                 {msg.status === 'SENT' ? (
                                   <Check className="w-3.5 h-3.5 text-slate-400 inline" />
                                 ) : (
-                                  <CheckCheck className="w-4 h-4 text-[#00f0ff] inline" />
+                                  <CheckCheck
+                                    className="w-4 h-4 inline"
+                                    style={{ color: 'var(--slk-accent)' }}
+                                  />
                                 )}
                               </span>
                             )}
@@ -3216,7 +3507,7 @@ export default function App() {
 
                         {/* Optional Inline Raw Ciphertext Inspector */}
                         {showCiphertextInline && (
-                          <div className="mt-2 pt-1.5 border-t border-white/10 text-[10px] text-cyan-300/80 font-mono space-y-0.5">
+                          <div className="mt-2 pt-1.5 border-t border-white/10 text-[10px] font-mono space-y-0.5 opacity-80">
                             <div className="truncate">AES-GCM: {msg.ciphertextPreview}</div>
                             <div className="truncate">IV: {msg.ivHex} · SHA256: {msg.sha256Hash.slice(0, 16)}...</div>
                           </div>
@@ -3231,7 +3522,13 @@ export default function App() {
 
             {/* Emoji Quick Picker Popover */}
             {showEmojiPicker && (
-              <div className="px-4 py-2.5 bg-[#182229] border-t border-[#222e35] flex items-center justify-between gap-2 z-20">
+              <div
+                className="px-4 py-2.5 border-t flex items-center justify-between gap-2 z-20"
+                style={{
+                  backgroundColor: 'var(--slk-bg-header)',
+                  borderColor: 'var(--slk-border)',
+                }}
+              >
                 <div className="flex items-center gap-2 overflow-x-auto">
                   {TACTICAL_EMOJIS.map((em) => (
                     <button
@@ -3252,7 +3549,12 @@ export default function App() {
                       'SITREP: Mohon laporan situasi terkini dan status keamanan perimeter.'
                     )
                   }
-                  className="px-3 py-1 rounded-full bg-[#05354c] border border-cyan-500/30 text-xs text-[#00f0ff] font-medium whitespace-nowrap shrink-0"
+                  className="px-3 py-1 rounded-full border text-xs font-medium whitespace-nowrap shrink-0"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-bubble-own)',
+                    borderColor: 'var(--slk-accent)',
+                    color: 'var(--slk-accent)',
+                  }}
                 >
                   Kirim SITREP
                 </button>
@@ -3261,18 +3563,27 @@ export default function App() {
 
             {/* WhatsApp Standard Bottom Input Bar */}
             {isRecordingVoice ? (
-              <div className="px-3 py-2.5 bg-[#111b21] border-t border-[#1f2c34] flex items-center justify-between gap-3 z-20">
+              <div
+                className="px-3 py-2.5 border-t flex items-center justify-between gap-3 z-20"
+                style={{
+                  backgroundColor: 'var(--slk-bg-header)',
+                  borderColor: 'var(--slk-border)',
+                }}
+              >
                 <div className="flex items-center gap-2.5 min-w-0">
                   <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping shrink-0" />
-                  <span className="text-sm font-semibold text-[#e9edef] tabular-nums">
+                  <span className="text-sm font-semibold tabular-nums">
                     0:{recordingSeconds.toString().padStart(2, '0')}
                   </span>
                   <div className="flex items-center gap-1 h-5 w-32 sm:w-44">
                     {liveVoiceWaveform.map((h, i) => (
                       <div
                         key={i}
-                        className="flex-1 bg-[#00f0ff] rounded-full transition-all"
-                        style={{ height: `${h}%` }}
+                        className="flex-1 rounded-full transition-all"
+                        style={{
+                          height: `${h}%`,
+                          backgroundColor: 'var(--slk-accent)',
+                        }}
                       />
                     ))}
                   </div>
@@ -3289,7 +3600,8 @@ export default function App() {
                   <button
                     type="button"
                     onClick={stopAndTransmitVoiceNote}
-                    className="w-11 h-11 rounded-full bg-[#00f0ff] hover:bg-cyan-300 text-[#031525] flex items-center justify-center shadow-lg transition-transform active:scale-95"
+                    className="w-11 h-11 rounded-full text-slate-950 flex items-center justify-center shadow-lg transition-transform active:scale-95"
+                    style={{ backgroundColor: 'var(--slk-accent)' }}
                     aria-label="Kirim Voice Note"
                   >
                     <Send className="w-5 h-5" />
@@ -3299,7 +3611,8 @@ export default function App() {
             ) : (
               <form
                 onSubmit={handleSendText}
-                className="px-2.5 py-2 bg-[#0b141a] flex items-center gap-2 z-20"
+                className="px-2.5 py-2 flex items-center gap-2 z-20"
+                style={{ backgroundColor: 'var(--slk-bg-main)' }}
               >
                 <input
                   ref={fileInputRef}
@@ -3318,11 +3631,18 @@ export default function App() {
                 />
 
                 {/* Rounded Pill Input Container */}
-                <div className="flex-1 bg-[#202c33] rounded-full px-2 py-1 flex items-center gap-1 border border-white/5">
+                <div
+                  className="flex-1 rounded-full px-2 py-1 flex items-center gap-1 border"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-input)',
+                    borderColor: 'var(--slk-border)',
+                  }}
+                >
                   <button
                     type="button"
                     onClick={() => setShowEmojiPicker(!showEmojiPicker)}
-                    className="w-9 h-9 rounded-full flex items-center justify-center text-[#8696a0] hover:text-[#e9edef] transition-colors shrink-0"
+                    className="w-9 h-9 rounded-full flex items-center justify-center hover:text-white transition-colors shrink-0"
+                    style={{ color: 'var(--slk-text-secondary)' }}
                     aria-label="Emoji"
                   >
                     <Smile className="w-5 h-5" />
@@ -3333,13 +3653,15 @@ export default function App() {
                     value={inputText}
                     onChange={(e) => setInputText(e.target.value)}
                     placeholder="Ketik pesan terenkripsi..."
-                    className="flex-1 bg-transparent py-1.5 px-1 text-sm text-[#e9edef] placeholder:text-[#8696a0] focus:outline-none min-w-0"
+                    className="flex-1 bg-transparent py-1.5 px-1 text-sm focus:outline-none min-w-0"
+                    style={{ color: 'var(--slk-text-primary)' }}
                   />
 
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    className="w-9 h-9 rounded-full flex items-center justify-center text-[#8696a0] hover:text-[#e9edef] transition-colors shrink-0"
+                    className="w-9 h-9 rounded-full flex items-center justify-center hover:text-white transition-colors shrink-0"
+                    style={{ color: 'var(--slk-text-secondary)' }}
                     title="Lampirkan File atau Dokumen"
                   >
                     <Paperclip className="w-5 h-5" />
@@ -3348,7 +3670,8 @@ export default function App() {
                   <button
                     type="button"
                     onClick={handleSendSampleReconImage}
-                    className="w-9 h-9 rounded-full flex items-center justify-center text-[#8696a0] hover:text-[#00f0ff] transition-colors shrink-0"
+                    className="w-9 h-9 rounded-full flex items-center justify-center transition-colors shrink-0"
+                    style={{ color: 'var(--slk-text-secondary)' }}
                     title="Kirim Foto / Citra Radar Recon"
                   >
                     <Camera className="w-5 h-5" />
@@ -3359,7 +3682,8 @@ export default function App() {
                 {inputText.trim() ? (
                   <button
                     type="submit"
-                    className="w-11 h-11 rounded-full bg-[#00f0ff] hover:bg-cyan-300 text-[#031525] flex items-center justify-center shrink-0 shadow-md transition-transform active:scale-95"
+                    className="w-11 h-11 rounded-full text-slate-950 flex items-center justify-center shrink-0 shadow-md transition-transform active:scale-95"
+                    style={{ backgroundColor: 'var(--slk-accent)' }}
                     aria-label="Kirim Pesan"
                   >
                     <Send className="w-5 h-5" />
@@ -3368,7 +3692,8 @@ export default function App() {
                   <button
                     type="button"
                     onClick={startVoiceNoteRecording}
-                    className="w-11 h-11 rounded-full bg-[#00f0ff] hover:bg-cyan-300 text-[#031525] flex items-center justify-center shrink-0 shadow-md transition-transform active:scale-95"
+                    className="w-11 h-11 rounded-full text-slate-950 flex items-center justify-center shrink-0 shadow-md transition-transform active:scale-95"
+                    style={{ backgroundColor: 'var(--slk-accent)' }}
                     title="Rekam Voice Note"
                     aria-label="Rekam Voice Note"
                   >
@@ -3383,42 +3708,83 @@ export default function App() {
              VIEW B: HOME SCREEN (WHATSAPP ANDROID DARK MODE 1-COLUMN VIEW)
              ===================================================================== */
           <div className="flex-1 flex flex-col h-full overflow-hidden relative">
-            {/* Top App Header: App Icon + "SILENT LINK" (left), Camera/Scan QR & 3-Dots Menu (right) */}
-            <header className="h-15 shrink-0 px-4 bg-[#111b21] flex items-center justify-between z-20 relative">
-              <div className="flex items-center gap-2.5">
+            {/* Top App Header: App Icon + "SILENT LINK" (left), Camera/Scan QR, Pengaturan HP & 3-Dots Menu (right) */}
+            <header
+              className="h-15 shrink-0 px-3.5 flex items-center justify-between z-20 relative border-b"
+              style={{
+                backgroundColor: 'var(--slk-bg-header)',
+                borderColor: 'var(--slk-border)',
+              }}
+            >
+              <div className="flex items-center gap-2 min-w-0">
                 <img
                   src="/assets/aistudio/1795167005810_e4bb8167.jpg"
                   alt="Icon Aplikasi Silent Link Diskomlekau"
-                  className="w-8 h-8 rounded-lg object-cover border border-cyan-400/40 shadow-md shrink-0"
+                  className="w-8 h-8 rounded-lg object-cover border shadow-md shrink-0"
+                  style={{ borderColor: 'var(--slk-accent)' }}
                 />
-                <span className="text-lg font-bold tracking-tight text-[#e9edef]">
+                <span className="text-base sm:text-lg font-bold tracking-tight truncate">
                   SILENT LINK
                 </span>
                 <span
-                  className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                    localIdentity.role === 'ADMIN'
-                      ? 'bg-[#00f0ff]/15 text-[#00f0ff] border border-[#00f0ff]/30'
-                      : 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
-                  }`}
+                  className="text-[10px] font-bold px-2 py-0.5 rounded-full border shrink-0"
+                  style={{
+                    backgroundColor: isLoggedIn
+                      ? 'var(--slk-accent-muted)'
+                      : 'rgba(239,68,68,0.15)',
+                    borderColor: isLoggedIn ? 'var(--slk-accent)' : '#ef4444',
+                    color: isLoggedIn ? 'var(--slk-accent)' : '#f87171',
+                  }}
                 >
-                  {localIdentity.role === 'ADMIN' ? 'ADMIN HP' : 'OPERATIVE'}
+                  {!isLoggedIn
+                    ? 'LOGGED OUT'
+                    : localIdentity.role === 'ADMIN'
+                    ? 'ADMIN HP'
+                    : 'OPERATIVE'}
                 </span>
               </div>
 
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-0.5 shrink-0">
+                {/* Quick Fullscreen Button on HP */}
+                <button
+                  type="button"
+                  onClick={toggleFullscreen}
+                  className="min-w-[38px] min-h-[38px] rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
+                  title="Tampilan Fullscreen HP"
+                >
+                  <Maximize2
+                    className="w-4 h-4"
+                    style={{
+                      color: isFullscreen
+                        ? 'var(--slk-accent)'
+                        : 'var(--slk-text-secondary)',
+                    }}
+                  />
+                </button>
+
                 <button
                   type="button"
                   onClick={() => setIsOperativeOnboardingOpen(true)}
-                  className="min-w-[42px] min-h-[42px] rounded-full flex items-center justify-center text-[#e9edef] hover:bg-white/10 transition-colors"
+                  className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
                   title="Kamera / Scan QR Code Admin"
                 >
                   <Camera className="w-5 h-5" />
                 </button>
 
+                {/* Dedicated Mobile Settings Button (Tombol Pengaturan pada HP) */}
+                <button
+                  type="button"
+                  onClick={() => setIsSettingsOpen(true)}
+                  className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center hover:bg-white/10 transition-colors relative"
+                  title="Pengaturan HP, Akun, Login/Logout & Tema Militer"
+                >
+                  <Settings className="w-5 h-5" style={{ color: 'var(--slk-accent)' }} />
+                </button>
+
                 <button
                   type="button"
                   onClick={() => setShowTopMenuDropdown(!showTopMenuDropdown)}
-                  className="min-w-[42px] min-h-[42px] rounded-full flex items-center justify-center text-[#e9edef] hover:bg-white/10 transition-colors"
+                  className="min-w-[38px] min-h-[38px] rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
                   aria-label="Menu"
                 >
                   <MoreVertical className="w-5 h-5" />
@@ -3427,7 +3793,27 @@ export default function App() {
 
               {/* 3-Dots Dropdown Menu (WhatsApp Android Style) */}
               {showTopMenuDropdown && (
-                <div className="absolute right-3 top-14 w-64 bg-[#233138] border border-white/10 rounded-xl shadow-2xl py-1.5 z-50 text-sm text-[#e9edef]">
+                <div
+                  className="absolute right-3 top-14 w-68 border rounded-xl shadow-2xl py-1.5 z-50 text-sm"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-card)',
+                    borderColor: 'var(--slk-border)',
+                    color: 'var(--slk-text-primary)',
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowTopMenuDropdown(false);
+                      setIsSettingsOpen(true);
+                    }}
+                    className="w-full px-4 py-2.5 text-left hover:bg-white/5 flex items-center gap-2.5 font-semibold"
+                    style={{ color: 'var(--slk-accent)' }}
+                  >
+                    <Settings className="w-4 h-4" />
+                    <span>Pengaturan HP, Akun &amp; Tema Militer</span>
+                  </button>
+
                   {localIdentity.role === 'ADMIN' ? (
                     <button
                       type="button"
@@ -3435,9 +3821,9 @@ export default function App() {
                         setShowTopMenuDropdown(false);
                         setIsAdminProvisionOpen(true);
                       }}
-                      className="w-full px-4 py-2.5 text-left hover:bg-[#182229] flex items-center gap-2.5 text-[#00f0ff] font-medium"
+                      className="w-full px-4 py-2.5 text-left hover:bg-white/5 flex items-center gap-2.5 font-medium"
                     >
-                      <QrCode className="w-4 h-4" />
+                      <QrCode className="w-4 h-4" style={{ color: 'var(--slk-accent)' }} />
                       <span>+ Buat QR &amp; Link Personel</span>
                     </button>
                   ) : (
@@ -3447,9 +3833,9 @@ export default function App() {
                         setShowTopMenuDropdown(false);
                         handleRestoreAdminRole();
                       }}
-                      className="w-full px-4 py-2.5 text-left hover:bg-[#182229] flex items-center gap-2.5 text-[#00f0ff] font-medium"
+                      className="w-full px-4 py-2.5 text-left hover:bg-white/5 flex items-center gap-2.5 font-medium"
                     >
-                      <KeyRound className="w-4 h-4" />
+                      <KeyRound className="w-4 h-4" style={{ color: 'var(--slk-accent)' }} />
                       <span>Beralih ke Master Admin HP</span>
                     </button>
                   )}
@@ -3460,7 +3846,7 @@ export default function App() {
                       setShowTopMenuDropdown(false);
                       setIsOperativeOnboardingOpen(true);
                     }}
-                    className="w-full px-4 py-2.5 text-left hover:bg-[#182229] flex items-center gap-2.5"
+                    className="w-full px-4 py-2.5 text-left hover:bg-white/5 flex items-center gap-2.5"
                   >
                     <ScanLine className="w-4 h-4 text-slate-400" />
                     <span>Scan QR / Link Onboarding</span>
@@ -3472,7 +3858,7 @@ export default function App() {
                       setShowTopMenuDropdown(false);
                       setIsManualSdpOpen(true);
                     }}
-                    className="w-full px-4 py-2.5 text-left hover:bg-[#182229] flex items-center gap-2.5"
+                    className="w-full px-4 py-2.5 text-left hover:bg-white/5 flex items-center gap-2.5"
                   >
                     <Terminal className="w-4 h-4 text-slate-400" />
                     <span>Koneksi SDP Manual (Air-Gap)</span>
@@ -3484,18 +3870,21 @@ export default function App() {
                       setShowTopMenuDropdown(false);
                       setShowSecuritySheet(true);
                     }}
-                    className="w-full px-4 py-2.5 text-left hover:bg-[#182229] flex items-center gap-2.5"
+                    className="w-full px-4 py-2.5 text-left hover:bg-white/5 flex items-center gap-2.5"
                   >
                     <ShieldCheck className="w-4 h-4 text-slate-400" />
-                    <span>Info Enkripsi &amp; Kunci Sesi</span>
+                    <span>Info Enkripsi &amp; Diagnostik ICE</span>
                   </button>
 
-                  <div className="my-1 border-t border-white/10" />
+                  <div
+                    className="my-1 border-t"
+                    style={{ borderColor: 'var(--slk-border)' }}
+                  />
 
                   <button
                     type="button"
                     onClick={handlePurgeSessionMemory}
-                    className="w-full px-4 py-2.5 text-left hover:bg-[#182229] flex items-center gap-2.5 text-red-400"
+                    className="w-full px-4 py-2.5 text-left hover:bg-white/5 flex items-center gap-2.5 text-red-400"
                   >
                     <Trash2 className="w-4 h-4" />
                     <span>Hapus Sesi &amp; Wipe RAM</span>
@@ -3504,66 +3893,159 @@ export default function App() {
               )}
             </header>
 
+            {/* Logged-Out Quick Banner (if user logged out in Settings) */}
+            {!isLoggedIn && (
+              <div className="px-4 py-3 bg-red-950/60 border-b border-red-500/40 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-bold text-red-300">
+                    Sesi Akun Personel Nonaktif (Logged Out)
+                  </div>
+                  <div className="text-[11px] text-red-200/80 truncate">
+                    Login kembali atau Scan QR Admin untuk mengaktifkan kanal E2EE.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsSettingsOpen(true)}
+                  className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-bold text-slate-950 flex items-center gap-1.5"
+                  style={{ backgroundColor: 'var(--slk-accent)' }}
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>Login</span>
+                </button>
+              </div>
+            )}
+
             {/* =================================================================
                 TAB 1: CHAT LIST (DEFAULT WHATSAPP HOME)
                ================================================================= */}
             {activeBottomTab === 'chat' && (
               <div className="flex-1 flex flex-col overflow-hidden">
-                {/* Rounded Search Bar */}
-                <div className="px-3.5 pt-2.5 pb-2 bg-[#111b21]">
-                  <div className="relative flex items-center bg-[#202c33] rounded-full px-3.5 py-2">
-                    <Search className="w-4 h-4 text-[#8696a0] mr-2.5 shrink-0" />
+                {/* Rounded Search Bar & Quick Theme/Settings Strip */}
+                <div
+                  className="px-3.5 pt-2.5 pb-2 border-b"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-header)',
+                    borderColor: 'var(--slk-border)',
+                  }}
+                >
+                  <div
+                    className="relative flex items-center rounded-full px-3.5 py-2 border"
+                    style={{
+                      backgroundColor: 'var(--slk-bg-input)',
+                      borderColor: 'var(--slk-border)',
+                    }}
+                  >
+                    <Search
+                      className="w-4 h-4 mr-2.5 shrink-0"
+                      style={{ color: 'var(--slk-text-secondary)' }}
+                    />
                     <input
                       type="text"
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
                       placeholder="Cari Nama Personel atau NRP..."
-                      className="w-full bg-transparent text-sm text-[#e9edef] placeholder:text-[#8696a0] focus:outline-none"
+                      className="w-full bg-transparent text-sm focus:outline-none"
+                      style={{ color: 'var(--slk-text-primary)' }}
                     />
                   </div>
 
-                  {/* Filter Pills: "Semua", "Belum dibaca", "Grup" */}
-                  <div className="flex items-center gap-2 mt-2.5 pb-1 overflow-x-auto">
+                  {/* Filter Pills: "Semua", "Belum dibaca", "Grup" + Quick Theme Pill */}
+                  <div className="flex items-center justify-between gap-2 mt-2.5 pb-1 overflow-x-auto">
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setChatFilterPill('all')}
+                        className="px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap border"
+                        style={{
+                          backgroundColor:
+                            chatFilterPill === 'all'
+                              ? 'var(--slk-accent-muted)'
+                              : 'var(--slk-bg-input)',
+                          borderColor:
+                            chatFilterPill === 'all'
+                              ? 'var(--slk-accent)'
+                              : 'transparent',
+                          color:
+                            chatFilterPill === 'all'
+                              ? 'var(--slk-accent)'
+                              : 'var(--slk-text-secondary)',
+                        }}
+                      >
+                        Semua
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setChatFilterPill('unread')}
+                        className="px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap border"
+                        style={{
+                          backgroundColor:
+                            chatFilterPill === 'unread'
+                              ? 'var(--slk-accent-muted)'
+                              : 'var(--slk-bg-input)',
+                          borderColor:
+                            chatFilterPill === 'unread'
+                              ? 'var(--slk-accent)'
+                              : 'transparent',
+                          color:
+                            chatFilterPill === 'unread'
+                              ? 'var(--slk-accent)'
+                              : 'var(--slk-text-secondary)',
+                        }}
+                      >
+                        Belum dibaca {totalUnreadChats > 0 ? `(${totalUnreadChats})` : ''}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setChatFilterPill('groups')}
+                        className="px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap border"
+                        style={{
+                          backgroundColor:
+                            chatFilterPill === 'groups'
+                              ? 'var(--slk-accent-muted)'
+                              : 'var(--slk-bg-input)',
+                          borderColor:
+                            chatFilterPill === 'groups'
+                              ? 'var(--slk-accent)'
+                              : 'transparent',
+                          color:
+                            chatFilterPill === 'groups'
+                              ? 'var(--slk-accent)'
+                              : 'var(--slk-text-secondary)',
+                        }}
+                      >
+                        Grup
+                      </button>
+                    </div>
+
+                    {/* Quick 1-Tap Military Theme Switcher Pill */}
                     <button
                       type="button"
-                      onClick={() => setChatFilterPill('all')}
-                      className={`px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap ${
-                        chatFilterPill === 'all'
-                          ? 'bg-[#00f0ff]/20 text-[#00f0ff] border border-[#00f0ff]/40'
-                          : 'bg-[#202c33] text-[#8696a0] hover:text-[#e9edef]'
-                      }`}
+                      onClick={() => setIsSettingsOpen(true)}
+                      className="px-2.5 py-1.5 rounded-full text-[11px] font-semibold flex items-center gap-1 border shrink-0"
+                      style={{
+                        backgroundColor: 'var(--slk-bg-input)',
+                        borderColor: 'var(--slk-border)',
+                        color: 'var(--slk-accent)',
+                      }}
+                      title="Buka Pengaturan & Pilihan Tema Militer"
                     >
-                      Semua
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setChatFilterPill('unread')}
-                      className={`px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap ${
-                        chatFilterPill === 'unread'
-                          ? 'bg-[#00f0ff]/20 text-[#00f0ff] border border-[#00f0ff]/40'
-                          : 'bg-[#202c33] text-[#8696a0] hover:text-[#e9edef]'
-                      }`}
-                    >
-                      Belum dibaca {totalUnreadChats > 0 ? `(${totalUnreadChats})` : ''}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setChatFilterPill('groups')}
-                      className={`px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap ${
-                        chatFilterPill === 'groups'
-                          ? 'bg-[#00f0ff]/20 text-[#00f0ff] border border-[#00f0ff]/40'
-                          : 'bg-[#202c33] text-[#8696a0] hover:text-[#e9edef]'
-                      }`}
-                    >
-                      Grup
+                      <Palette className="w-3.5 h-3.5" />
+                      <span>Tema</span>
                     </button>
                   </div>
                 </div>
 
                 {/* Chat Rows List */}
-                <div className="flex-1 overflow-y-auto divide-y divide-[#1f2c34]/60 pb-24">
+                <div
+                  className="flex-1 overflow-y-auto divide-y pb-24"
+                  style={{ borderColor: 'var(--slk-border)' }}
+                >
                   {filteredContacts.length === 0 ? (
-                    <div className="py-16 text-center text-sm text-[#8696a0]">
+                    <div
+                      className="py-16 text-center text-sm"
+                      style={{ color: 'var(--slk-text-secondary)' }}
+                    >
                       Tidak ada obrolan personel yang cocok.
                     </div>
                   ) : (
@@ -3574,7 +4056,7 @@ export default function App() {
                           key={contact.peerId}
                           type="button"
                           onClick={() => handleOpenChatRoom(contact)}
-                          className="w-full px-4 py-3 hover:bg-[#202c33]/60 active:bg-[#202c33] transition-colors flex items-center gap-3.5 text-left"
+                          className="w-full px-4 py-3 hover:bg-white/5 active:bg-white/10 transition-colors flex items-center gap-3.5 text-left"
                         >
                           {/* Left Circular Avatar */}
                           <div className="relative shrink-0">
@@ -3590,9 +4072,12 @@ export default function App() {
                               )}
                             </div>
                             <span
-                              className={`w-3 h-3 rounded-full border-2 border-[#0b141a] absolute bottom-0 right-0 ${
-                                isConnected ? 'bg-[#00f0ff]' : 'bg-slate-500'
-                              }`}
+                              className="w-3 h-3 rounded-full border-2 border-[#0b141a] absolute bottom-0 right-0"
+                              style={{
+                                backgroundColor: isConnected
+                                  ? 'var(--slk-accent)'
+                                  : '#64748b',
+                              }}
                             />
                           </div>
 
@@ -3600,19 +4085,29 @@ export default function App() {
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center justify-between gap-2">
                               <div className="truncate flex items-center gap-1.5">
-                                <span className="text-[15px] font-semibold text-[#e9edef] truncate">
+                                <span className="text-[15px] font-semibold truncate">
                                   {contact.personnelName}
                                 </span>
-                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-950/80 border border-cyan-500/30 text-[#00f0ff] shrink-0">
+                                <span
+                                  className="text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0"
+                                  style={{
+                                    backgroundColor: 'var(--slk-accent-muted)',
+                                    borderColor: 'var(--slk-border)',
+                                    color: 'var(--slk-accent)',
+                                  }}
+                                >
                                   {contact.peerId}
                                 </span>
                               </div>
                               <span
-                                className={`text-xs shrink-0 tabular-nums ${
-                                  contact.unreadCount > 0
-                                    ? 'text-[#00f0ff] font-semibold'
-                                    : 'text-[#8696a0]'
-                                }`}
+                                className="text-xs shrink-0 tabular-nums"
+                                style={{
+                                  color:
+                                    contact.unreadCount > 0
+                                      ? 'var(--slk-accent)'
+                                      : 'var(--slk-text-secondary)',
+                                  fontWeight: contact.unreadCount > 0 ? 600 : 400,
+                                }}
                               >
                                 {new Date(contact.lastActivityTime).toLocaleTimeString('id-ID', {
                                   hour: '2-digit',
@@ -3624,15 +4119,24 @@ export default function App() {
 
                             <div className="flex items-center justify-between gap-2 mt-1">
                               <div className="flex items-center gap-1 min-w-0 flex-1">
-                                <CheckCheck className="w-4 h-4 text-[#00f0ff] shrink-0" />
-                                <p className="text-xs sm:text-sm text-[#8696a0] truncate">
+                                <CheckCheck
+                                  className="w-4 h-4 shrink-0"
+                                  style={{ color: 'var(--slk-accent)' }}
+                                />
+                                <p
+                                  className="text-xs sm:text-sm truncate"
+                                  style={{ color: 'var(--slk-text-secondary)' }}
+                                >
                                   {contact.lastMessagePreview}
                                 </p>
                               </div>
 
-                              {/* Right Unread Badge (Neon Cyan) */}
+                              {/* Right Unread Badge */}
                               {contact.unreadCount > 0 && (
-                                <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-[#00f0ff] text-[#031525] text-[11px] font-bold flex items-center justify-center shrink-0">
+                                <span
+                                  className="min-w-[20px] h-5 px-1.5 rounded-full text-slate-950 text-[11px] font-bold flex items-center justify-center shrink-0"
+                                  style={{ backgroundColor: 'var(--slk-accent)' }}
+                                >
                                   {contact.unreadCount}
                                 </span>
                               )}
@@ -3644,10 +4148,17 @@ export default function App() {
                   )}
 
                   {/* Footer Encryption Note in Chat List */}
-                  <div className="py-6 px-4 text-center text-xs text-[#8696a0] flex items-center justify-center gap-1.5">
-                    <Lock className="w-3.5 h-3.5 text-[#00f0ff]" />
+                  <div
+                    className="py-6 px-4 text-center text-xs flex items-center justify-center gap-1.5"
+                    style={{ color: 'var(--slk-text-secondary)' }}
+                  >
+                    <Lock className="w-3.5 h-3.5" style={{ color: 'var(--slk-accent)' }} />
                     <span>
-                      Pesan pribadi Anda <strong className="text-[#00f0ff] font-normal">terenkripsi secara ujung-ke-ujung (P2P)</strong> &amp; Zero-Retention
+                      Pesan pribadi Anda{' '}
+                      <strong className="font-normal" style={{ color: 'var(--slk-accent)' }}>
+                        terenkripsi secara ujung-ke-ujung (P2P)
+                      </strong>{' '}
+                      &amp; tetap aktif di latar belakang
                     </span>
                   </div>
                 </div>
@@ -3660,16 +4171,28 @@ export default function App() {
             {activeBottomTab === 'status' && (
               <div className="flex-1 overflow-y-auto p-4 space-y-4 pb-24">
                 {/* My Status Card */}
-                <div className="p-3.5 rounded-2xl bg-[#111b21] border border-[#1f2c34] space-y-3">
+                <div
+                  className="p-3.5 rounded-2xl border space-y-3"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-card)',
+                    borderColor: 'var(--slk-border)',
+                  }}
+                >
                   <div className="flex items-center gap-3">
-                    <div className="w-12 h-12 rounded-full bg-gradient-to-br from-cyan-400 to-blue-700 flex items-center justify-center text-[#031525] font-bold">
+                    <div
+                      className="w-12 h-12 rounded-full flex items-center justify-center text-slate-950 font-bold"
+                      style={{ backgroundColor: 'var(--slk-accent)' }}
+                    >
                       {getInitials(localIdentity.personnelName)}
                     </div>
                     <div>
-                      <div className="text-sm font-bold text-[#e9edef]">
+                      <div className="text-sm font-bold">
                         Status Saya ({localIdentity.personnelName})
                       </div>
-                      <div className="text-xs text-[#8696a0]">
+                      <div
+                        className="text-xs"
+                        style={{ color: 'var(--slk-text-secondary)' }}
+                      >
                         NRP {localIdentity.nrp} · Hanya tersimpan di RAM sesi aktif
                       </div>
                     </div>
@@ -3706,18 +4229,27 @@ export default function App() {
                       value={newStatusText}
                       onChange={(e) => setNewStatusText(e.target.value)}
                       placeholder="Bagikan pembaruan SITREP terenkripsi..."
-                      className="flex-1 bg-[#202c33] rounded-full px-4 py-2 text-xs text-[#e9edef] placeholder:text-[#8696a0] focus:outline-none"
+                      className="flex-1 rounded-full px-4 py-2 text-xs focus:outline-none border"
+                      style={{
+                        backgroundColor: 'var(--slk-bg-input)',
+                        borderColor: 'var(--slk-border)',
+                        color: 'var(--slk-text-primary)',
+                      }}
                     />
                     <button
                       type="submit"
-                      className="px-4 py-2 rounded-full bg-[#00f0ff] text-[#031525] text-xs font-bold shrink-0"
+                      className="px-4 py-2 rounded-full text-slate-950 text-xs font-bold shrink-0"
+                      style={{ backgroundColor: 'var(--slk-accent)' }}
                     >
                       Siarkan
                     </button>
                   </form>
                 </div>
 
-                <div className="text-xs font-semibold text-[#8696a0] uppercase tracking-wider px-1">
+                <div
+                  className="text-xs font-semibold uppercase tracking-wider px-1"
+                  style={{ color: 'var(--slk-text-secondary)' }}
+                >
                   Pembaruan Terkini Jajaran
                 </div>
 
@@ -3725,27 +4257,44 @@ export default function App() {
                   {statusUpdates.map((st) => (
                     <div
                       key={st.id}
-                      className="p-3.5 rounded-2xl bg-[#111b21] border border-[#1f2c34] space-y-2"
+                      className="p-3.5 rounded-2xl border space-y-2"
+                      style={{
+                        backgroundColor: 'var(--slk-bg-card)',
+                        borderColor: 'var(--slk-border)',
+                      }}
                     >
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2.5">
                           <div
-                            className={`w-10 h-10 rounded-full p-0.5 bg-gradient-to-tr from-[#00f0ff] to-blue-500`}
+                            className="w-10 h-10 rounded-full p-0.5 border"
+                            style={{ borderColor: 'var(--slk-accent)' }}
                           >
-                            <div className="w-full h-full rounded-full bg-[#111b21] flex items-center justify-center text-xs font-bold text-[#00f0ff]">
+                            <div
+                              className="w-full h-full rounded-full flex items-center justify-center text-xs font-bold"
+                              style={{
+                                backgroundColor: 'var(--slk-bg-header)',
+                                color: 'var(--slk-accent)',
+                              }}
+                            >
                               {getInitials(st.authorName)}
                             </div>
                           </div>
                           <div>
-                            <div className="text-sm font-semibold text-[#e9edef]">
+                            <div className="text-sm font-semibold">
                               {st.authorName}
                             </div>
-                            <div className="text-xs text-[#8696a0]">
+                            <div
+                              className="text-xs"
+                              style={{ color: 'var(--slk-text-secondary)' }}
+                            >
                               {st.authorRank} · NRP {st.nrp}
                             </div>
                           </div>
                         </div>
-                        <span className="text-xs text-[#8696a0]">
+                        <span
+                          className="text-xs"
+                          style={{ color: 'var(--slk-text-secondary)' }}
+                        >
                           {new Date(st.timestamp).toLocaleTimeString('id-ID', {
                             hour: '2-digit',
                             minute: '2-digit',
@@ -3753,7 +4302,7 @@ export default function App() {
                           })}
                         </span>
                       </div>
-                      <p className="text-sm text-slate-200 leading-relaxed pl-1">
+                      <p className="text-sm leading-relaxed pl-1">
                         {st.content}
                       </p>
                     </div>
@@ -3767,7 +4316,10 @@ export default function App() {
                ================================================================= */}
             {activeBottomTab === 'groups' && (
               <div className="flex-1 overflow-y-auto p-4 space-y-3 pb-24">
-                <div className="text-xs font-semibold text-[#8696a0] uppercase tracking-wider px-1">
+                <div
+                  className="text-xs font-semibold uppercase tracking-wider px-1"
+                  style={{ color: 'var(--slk-text-secondary)' }}
+                >
                   Grup &amp; Satuan Komando P2P
                 </div>
                 {contacts.map((c) => (
@@ -3775,7 +4327,11 @@ export default function App() {
                     key={c.peerId}
                     type="button"
                     onClick={() => handleOpenChatRoom(c)}
-                    className="w-full p-3.5 rounded-2xl bg-[#111b21] hover:bg-[#202c33] border border-[#1f2c34] flex items-center justify-between gap-3 text-left transition-colors"
+                    className="w-full p-3.5 rounded-2xl border flex items-center justify-between gap-3 text-left transition-colors hover:bg-white/5"
+                    style={{
+                      backgroundColor: 'var(--slk-bg-card)',
+                      borderColor: 'var(--slk-border)',
+                    }}
                   >
                     <div className="flex items-center gap-3 min-w-0">
                       <div
@@ -3786,15 +4342,24 @@ export default function App() {
                         <Users className="w-5 h-5" />
                       </div>
                       <div className="min-w-0">
-                        <div className="text-sm font-semibold text-[#e9edef] truncate">
+                        <div className="text-sm font-semibold truncate">
                           {c.unit}
                         </div>
-                        <div className="text-xs text-[#8696a0] truncate">
+                        <div
+                          className="text-xs truncate"
+                          style={{ color: 'var(--slk-text-secondary)' }}
+                        >
                           {c.personnelName} · {c.frequency}
                         </div>
                       </div>
                     </div>
-                    <span className="px-3 py-1 rounded-full bg-[#00f0ff]/15 text-[#00f0ff] text-xs font-semibold shrink-0">
+                    <span
+                      className="px-3 py-1 rounded-full text-xs font-semibold shrink-0"
+                      style={{
+                        backgroundColor: 'var(--slk-accent-muted)',
+                        color: 'var(--slk-accent)',
+                      }}
+                    >
                       Buka Kanal
                     </span>
                   </button>
@@ -3807,7 +4372,10 @@ export default function App() {
                ================================================================= */}
             {activeBottomTab === 'calls' && (
               <div className="flex-1 overflow-y-auto p-4 space-y-3 pb-24">
-                <div className="text-xs font-semibold text-[#8696a0] uppercase tracking-wider px-1">
+                <div
+                  className="text-xs font-semibold uppercase tracking-wider px-1"
+                  style={{ color: 'var(--slk-text-secondary)' }}
+                >
                   Riwayat Panggilan P2P (Sesi RAM Aktif)
                 </div>
                 {callHistory.map((item) => {
@@ -3816,17 +4384,24 @@ export default function App() {
                   return (
                     <div
                       key={item.id}
-                      className="p-3.5 rounded-2xl bg-[#111b21] border border-[#1f2c34] flex items-center justify-between gap-3"
+                      className="p-3.5 rounded-2xl border flex items-center justify-between gap-3"
+                      style={{
+                        backgroundColor: 'var(--slk-bg-card)',
+                        borderColor: 'var(--slk-border)',
+                      }}
                     >
                       <div className="flex items-center gap-3 min-w-0">
                         <div className="w-11 h-11 rounded-full bg-gradient-to-br from-cyan-500 to-blue-700 flex items-center justify-center text-white font-bold shrink-0">
                           {getInitials(item.personnelName)}
                         </div>
                         <div className="min-w-0">
-                          <div className="text-sm font-semibold text-[#e9edef] truncate">
+                          <div className="text-sm font-semibold truncate">
                             {item.personnelName}
                           </div>
-                          <div className="text-xs text-[#8696a0]">
+                          <div
+                            className="text-xs"
+                            style={{ color: 'var(--slk-text-secondary)' }}
+                          >
                             {item.direction === 'incoming' ? '↙ Masuk' : '↗ Keluar'} ·{' '}
                             {new Date(item.timestamp).toLocaleTimeString('id-ID', {
                               hour: '2-digit',
@@ -3841,7 +4416,12 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => handleLaunchMediaCall(matchedContact, item.callType)}
-                        className="w-10 h-10 rounded-full bg-[#202c33] hover:bg-[#00f0ff] text-[#00f0ff] hover:text-[#031525] flex items-center justify-center transition-colors shrink-0"
+                        className="w-10 h-10 rounded-full flex items-center justify-center transition-colors shrink-0 border"
+                        style={{
+                          backgroundColor: 'var(--slk-bg-input)',
+                          borderColor: 'var(--slk-border)',
+                          color: 'var(--slk-accent)',
+                        }}
                         title="Mulai Panggilan P2P"
                       >
                         {item.callType === 'video' ? (
@@ -3857,11 +4437,12 @@ export default function App() {
             )}
 
             {/* Floating Action Button (FAB) at Bottom-Right (ADMIN HP Exclusive) */}
-            {localIdentity.role === 'ADMIN' && (
+            {localIdentity.role === 'ADMIN' && isLoggedIn && (
               <button
                 type="button"
                 onClick={() => setIsAdminProvisionOpen(true)}
-                className="absolute bottom-20 right-4 z-30 h-14 px-4 rounded-2xl bg-[#00f0ff] hover:bg-cyan-300 text-[#031525] font-bold text-xs sm:text-sm flex items-center gap-2 shadow-xl shadow-cyan-500/20 transition-transform active:scale-95"
+                className="absolute bottom-20 right-4 z-30 h-13 px-4 rounded-2xl text-slate-950 font-bold text-xs sm:text-sm flex items-center gap-2 shadow-xl transition-transform active:scale-95"
+                style={{ backgroundColor: 'var(--slk-accent)' }}
                 title="Khusus Admin HP: + Buat QR & Link Personel Baru"
               >
                 <Plus className="w-5 h-5 stroke-[2.5]" />
@@ -3869,33 +4450,48 @@ export default function App() {
               </button>
             )}
 
-            {/* Bottom Navigation Bar (4 Tabs at the Very Bottom) */}
-            <nav className="h-16 shrink-0 bg-[#111b21] border-t border-[#1f2c34] grid grid-cols-4 items-center z-20">
+            {/* Bottom Navigation Bar (5 Tabs at the Very Bottom including Pengaturan HP) */}
+            <nav
+              className="h-16 shrink-0 border-t grid grid-cols-5 items-center z-20"
+              style={{
+                backgroundColor: 'var(--slk-bg-header)',
+                borderColor: 'var(--slk-border)',
+              }}
+            >
               <button
                 type="button"
                 onClick={() => setActiveBottomTab('chat')}
                 className="flex flex-col items-center justify-center h-full relative"
               >
                 <div
-                  className={`px-4 py-1 rounded-full flex items-center justify-center transition-colors relative ${
-                    activeBottomTab === 'chat'
-                      ? 'bg-[#00f0ff]/20 text-[#00f0ff]'
-                      : 'text-[#8696a0]'
-                  }`}
+                  className="px-3.5 py-1 rounded-full flex items-center justify-center transition-colors relative"
+                  style={{
+                    backgroundColor:
+                      activeBottomTab === 'chat' ? 'var(--slk-accent-muted)' : 'transparent',
+                    color:
+                      activeBottomTab === 'chat'
+                        ? 'var(--slk-accent)'
+                        : 'var(--slk-text-secondary)',
+                  }}
                 >
                   <MessageSquare className="w-5 h-5" />
                   {totalUnreadChats > 0 && (
-                    <span className="absolute -top-1 right-1 min-w-[16px] h-4 px-1 rounded-full bg-[#00f0ff] text-[#031525] text-[10px] font-bold flex items-center justify-center">
+                    <span
+                      className="absolute -top-1 right-0.5 min-w-[16px] h-4 px-1 rounded-full text-slate-950 text-[10px] font-bold flex items-center justify-center"
+                      style={{ backgroundColor: 'var(--slk-accent)' }}
+                    >
                       {totalUnreadChats}
                     </span>
                   )}
                 </div>
                 <span
-                  className={`text-[11px] mt-0.5 ${
-                    activeBottomTab === 'chat'
-                      ? 'font-bold text-[#e9edef]'
-                      : 'font-medium text-[#8696a0]'
-                  }`}
+                  className="text-[10px] mt-0.5 font-semibold"
+                  style={{
+                    color:
+                      activeBottomTab === 'chat'
+                        ? 'var(--slk-text-primary)'
+                        : 'var(--slk-text-secondary)',
+                  }}
                 >
                   Chat
                 </span>
@@ -3907,22 +4503,28 @@ export default function App() {
                 className="flex flex-col items-center justify-center h-full"
               >
                 <div
-                  className={`px-4 py-1 rounded-full flex items-center justify-center transition-colors ${
-                    activeBottomTab === 'status'
-                      ? 'bg-[#00f0ff]/20 text-[#00f0ff]'
-                      : 'text-[#8696a0]'
-                  }`}
+                  className="px-3.5 py-1 rounded-full flex items-center justify-center transition-colors"
+                  style={{
+                    backgroundColor:
+                      activeBottomTab === 'status' ? 'var(--slk-accent-muted)' : 'transparent',
+                    color:
+                      activeBottomTab === 'status'
+                        ? 'var(--slk-accent)'
+                        : 'var(--slk-text-secondary)',
+                  }}
                 >
                   <Radio className="w-5 h-5" />
                 </div>
                 <span
-                  className={`text-[11px] mt-0.5 ${
-                    activeBottomTab === 'status'
-                      ? 'font-bold text-[#e9edef]'
-                      : 'font-medium text-[#8696a0]'
-                  }`}
+                  className="text-[10px] mt-0.5 font-semibold truncate max-w-full px-1"
+                  style={{
+                    color:
+                      activeBottomTab === 'status'
+                        ? 'var(--slk-text-primary)'
+                        : 'var(--slk-text-secondary)',
+                  }}
                 >
-                  Status/Pembaruan
+                  Status
                 </span>
               </button>
 
@@ -3932,22 +4534,28 @@ export default function App() {
                 className="flex flex-col items-center justify-center h-full"
               >
                 <div
-                  className={`px-4 py-1 rounded-full flex items-center justify-center transition-colors ${
-                    activeBottomTab === 'groups'
-                      ? 'bg-[#00f0ff]/20 text-[#00f0ff]'
-                      : 'text-[#8696a0]'
-                  }`}
+                  className="px-3.5 py-1 rounded-full flex items-center justify-center transition-colors"
+                  style={{
+                    backgroundColor:
+                      activeBottomTab === 'groups' ? 'var(--slk-accent-muted)' : 'transparent',
+                    color:
+                      activeBottomTab === 'groups'
+                        ? 'var(--slk-accent)'
+                        : 'var(--slk-text-secondary)',
+                  }}
                 >
                   <Users className="w-5 h-5" />
                 </div>
                 <span
-                  className={`text-[11px] mt-0.5 ${
-                    activeBottomTab === 'groups'
-                      ? 'font-bold text-[#e9edef]'
-                      : 'font-medium text-[#8696a0]'
-                  }`}
+                  className="text-[10px] mt-0.5 font-semibold"
+                  style={{
+                    color:
+                      activeBottomTab === 'groups'
+                        ? 'var(--slk-text-primary)'
+                        : 'var(--slk-text-secondary)',
+                  }}
                 >
-                  Grup/Satuan
+                  Satuan
                 </span>
               </button>
 
@@ -3957,22 +4565,51 @@ export default function App() {
                 className="flex flex-col items-center justify-center h-full"
               >
                 <div
-                  className={`px-4 py-1 rounded-full flex items-center justify-center transition-colors ${
-                    activeBottomTab === 'calls'
-                      ? 'bg-[#00f0ff]/20 text-[#00f0ff]'
-                      : 'text-[#8696a0]'
-                  }`}
+                  className="px-3.5 py-1 rounded-full flex items-center justify-center transition-colors"
+                  style={{
+                    backgroundColor:
+                      activeBottomTab === 'calls' ? 'var(--slk-accent-muted)' : 'transparent',
+                    color:
+                      activeBottomTab === 'calls'
+                        ? 'var(--slk-accent)'
+                        : 'var(--slk-text-secondary)',
+                  }}
                 >
                   <Phone className="w-5 h-5" />
                 </div>
                 <span
-                  className={`text-[11px] mt-0.5 ${
-                    activeBottomTab === 'calls'
-                      ? 'font-bold text-[#e9edef]'
-                      : 'font-medium text-[#8696a0]'
-                  }`}
+                  className="text-[10px] mt-0.5 font-semibold"
+                  style={{
+                    color:
+                      activeBottomTab === 'calls'
+                        ? 'var(--slk-text-primary)'
+                        : 'var(--slk-text-secondary)',
+                  }}
                 >
                   Panggilan
+                </span>
+              </button>
+
+              {/* 5th Tab: Dedicated Mobile Settings Button (Pengaturan HP) */}
+              <button
+                type="button"
+                onClick={() => setIsSettingsOpen(true)}
+                className="flex flex-col items-center justify-center h-full"
+              >
+                <div
+                  className="px-3.5 py-1 rounded-full flex items-center justify-center transition-colors"
+                  style={{
+                    backgroundColor: isSettingsOpen ? 'var(--slk-accent-muted)' : 'transparent',
+                    color: 'var(--slk-accent)',
+                  }}
+                >
+                  <Settings className="w-5 h-5" />
+                </div>
+                <span
+                  className="text-[10px] mt-0.5 font-bold"
+                  style={{ color: 'var(--slk-accent)' }}
+                >
+                  Pengaturan
                 </span>
               </button>
             </nav>
@@ -3983,10 +4620,23 @@ export default function App() {
       {/* Security, E2EE & WebRTC ICE/DataChannel Diagnostic Sheet */}
       {showSecuritySheet && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4">
-          <div className="w-full max-w-lg max-h-[90vh] flex flex-col bg-[#111b21] border border-[#222e35] rounded-2xl text-[#e9edef] shadow-2xl overflow-hidden">
-            <div className="flex items-center justify-between px-5 py-4 border-b border-[#222e35] bg-[#202c33] shrink-0">
+          <div
+            className="w-full max-w-lg max-h-[90vh] flex flex-col border rounded-2xl shadow-2xl overflow-hidden"
+            style={{
+              backgroundColor: 'var(--slk-bg-card)',
+              borderColor: 'var(--slk-border)',
+              color: 'var(--slk-text-primary)',
+            }}
+          >
+            <div
+              className="flex items-center justify-between px-5 py-4 border-b shrink-0"
+              style={{
+                backgroundColor: 'var(--slk-bg-header)',
+                borderColor: 'var(--slk-border)',
+              }}
+            >
               <div className="flex items-center gap-2">
-                <ShieldCheck className="w-5 h-5 text-[#00f0ff]" />
+                <ShieldCheck className="w-5 h-5" style={{ color: 'var(--slk-accent)' }} />
                 <h3 className="text-base font-bold">
                   Diagnostik WebRTC ICE, SDP &amp; DataChannel
                 </h3>
@@ -4001,43 +4651,58 @@ export default function App() {
             </div>
 
             <div className="p-5 space-y-4 text-xs overflow-y-auto">
-              <div className="p-3.5 rounded-xl bg-[#0b141a] border border-cyan-500/20 space-y-1.5">
+              <div
+                className="p-3.5 rounded-xl border space-y-1.5"
+                style={{
+                  backgroundColor: 'var(--slk-bg-main)',
+                  borderColor: 'var(--slk-border)',
+                }}
+              >
                 <div className="flex items-center justify-between">
-                  <span className="text-slate-400">Personel Aktif</span>
-                  <span className="font-bold text-[#e9edef]">
+                  <span style={{ color: 'var(--slk-text-secondary)' }}>Personel Aktif</span>
+                  <span className="font-bold">
                     {localIdentity.personnelName} (NRP {localIdentity.nrp})
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="text-slate-400">ID Node &amp; Role</span>
-                  <span className="font-mono font-bold text-[#00f0ff]">
+                  <span style={{ color: 'var(--slk-text-secondary)' }}>ID Node &amp; Role</span>
+                  <span className="font-mono font-bold" style={{ color: 'var(--slk-accent)' }}>
                     {localIdentity.peerId} ({localIdentity.role})
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="text-slate-400">Konfigurasi DataChannel</span>
+                  <span style={{ color: 'var(--slk-text-secondary)' }}>Konfigurasi DataChannel</span>
                   <span className="font-mono text-emerald-400">
                     ordered: true, reliable: true (0% Loss)
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="text-slate-400">Status ICE &amp; DataChannel</span>
-                  <span className="font-mono text-[#00f0ff]">
+                  <span style={{ color: 'var(--slk-text-secondary)' }}>Status ICE &amp; DataChannel</span>
+                  <span className="font-mono" style={{ color: 'var(--slk-accent)' }}>
                     ICE: {(activeContact?.iceState || 'connected').toUpperCase()} · DC:{' '}
                     {(activeContact?.dataChannelState || 'open').toUpperCase()}
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="text-slate-400">Zero-Data Retention</span>
-                  <span className="text-[#00f0ff] font-semibold">
+                  <span style={{ color: 'var(--slk-text-secondary)' }}>Zero-Data Retention</span>
+                  <span className="font-semibold" style={{ color: 'var(--slk-accent)' }}>
                     0 Byte Disk ({totalEncryptedPackets} Paket RAM)
                   </span>
                 </div>
               </div>
 
               <div className="space-y-1.5">
-                <div className="text-slate-400">Sidik Jari Kunci ECDH P-256 (SHA-256):</div>
-                <div className="p-2.5 rounded-xl bg-[#0b141a] border border-[#222e35] font-mono text-[11px] text-[#00f0ff] break-all leading-relaxed">
+                <div style={{ color: 'var(--slk-text-secondary)' }}>
+                  Sidik Jari Kunci ECDH P-256 (SHA-256):
+                </div>
+                <div
+                  className="p-2.5 rounded-xl border font-mono text-[11px] break-all leading-relaxed"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-main)',
+                    borderColor: 'var(--slk-border)',
+                    color: 'var(--slk-accent)',
+                  }}
+                >
                   {activeContact?.remoteFingerprint || localIdentity.fingerprint}
                 </div>
               </div>
@@ -4045,15 +4710,21 @@ export default function App() {
               {/* Real-Time oniceconnectionstatechange & SDP/DataChannel Monitor */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-slate-400 flex items-center gap-1.5 font-semibold">
-                    <Terminal className="w-3.5 h-3.5 text-[#00f0ff]" />
+                  <span className="flex items-center gap-1.5 font-semibold" style={{ color: 'var(--slk-text-secondary)' }}>
+                    <Terminal className="w-3.5 h-3.5" style={{ color: 'var(--slk-accent)' }} />
                     Log Real-Time ICE Agent &amp; SDP Handshake ({iceDiagnosticLogs.length})
                   </span>
                   <span className="text-[10px] font-mono text-emerald-400">
                     oniceconnectionstatechange
                   </span>
                 </div>
-                <div className="max-h-40 overflow-y-auto rounded-xl bg-[#060d13] border border-[#222e35] p-2.5 font-mono text-[10px] space-y-1.5">
+                <div
+                  className="max-h-40 overflow-y-auto rounded-xl border p-2.5 font-mono text-[10px] space-y-1.5"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-main)',
+                    borderColor: 'var(--slk-border)',
+                  }}
+                >
                   {iceDiagnosticLogs.length === 0 ? (
                     <div className="text-slate-500 py-3 text-center">
                       Menunggu aktivitas ICE Candidate / SDP Handshake...
@@ -4065,7 +4736,7 @@ export default function App() {
                         className="pb-1.5 border-b border-white/5 last:border-b-0 leading-snug"
                       >
                         <div className="flex items-center justify-between text-[9px] text-slate-400">
-                          <span className="text-[#00f0ff] font-bold">
+                          <span className="font-bold" style={{ color: 'var(--slk-accent)' }}>
                             [{log.category}] {log.peerName}
                           </span>
                           <span>
@@ -4107,7 +4778,12 @@ export default function App() {
                         });
                       }
                     }}
-                    className="w-full py-2.5 px-4 rounded-full bg-[#05354c] hover:bg-[#084b6b] border border-[#00f0ff]/40 text-[#00f0ff] font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                    className="w-full py-2.5 px-4 rounded-full border font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                    style={{
+                      backgroundColor: 'var(--slk-bg-bubble-own)',
+                      borderColor: 'var(--slk-accent)',
+                      color: 'var(--slk-accent)',
+                    }}
                   >
                     <RefreshCw className="w-4 h-4" />
                     <span>Picu ICE Restart &amp; Re-Negosiasi SDP P2P</span>
@@ -4117,9 +4793,13 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setShowCiphertextInline(!showCiphertextInline)}
-                  className="w-full py-2.5 px-4 rounded-full bg-[#202c33] hover:bg-[#2a3942] text-slate-200 font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  className="w-full py-2.5 px-4 rounded-full font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-input)',
+                    color: 'var(--slk-text-primary)',
+                  }}
                 >
-                  <Eye className="w-4 h-4 text-[#00f0ff]" />
+                  <Eye className="w-4 h-4" style={{ color: 'var(--slk-accent)' }} />
                   <span>
                     {showCiphertextInline
                       ? 'Sembunyikan Ciphertext di Gelembung Chat'
@@ -4130,7 +4810,11 @@ export default function App() {
                 <button
                   type="button"
                   onClick={handleRotateSessionKey}
-                  className="w-full py-2.5 px-4 rounded-full bg-[#202c33] hover:bg-[#2a3942] text-[#00f0ff] font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  className="w-full py-2.5 px-4 rounded-full font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  style={{
+                    backgroundColor: 'var(--slk-bg-input)',
+                    color: 'var(--slk-accent)',
+                  }}
                 >
                   <RefreshCw className="w-4 h-4" />
                   <span>Rotasi Kunci Sesi ECDH P-256</span>
@@ -4140,6 +4824,40 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Modal 0: Mobile Settings Modal (Informasi Akun, Login/Logout, Fullscreen/Background Daemon, 4 Tema Militer) */}
+      <TacticalSettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        nodeIdentity={localIdentity}
+        isLoggedIn={isLoggedIn}
+        onLoginAccount={handleLoginAccount}
+        onLogoutAccount={handleLogoutAccount}
+        onWipeRamSession={handlePurgeSessionMemory}
+        onOpenQrScanner={() => setIsOperativeOnboardingOpen(true)}
+        activeTheme={activeTheme}
+        onSelectTheme={setActiveTheme}
+        isFullscreen={isFullscreen}
+        autoFullscreenOnTap={autoFullscreenOnTap}
+        onToggleFullscreen={toggleFullscreen}
+        onToggleAutoFullscreen={setAutoFullscreenOnTap}
+        keepAliveStatus={keepAliveStatus}
+        onToggleKeepAlive={(enabled) => {
+          if (enabled) {
+            tacticalBackgroundDaemon.start();
+          } else {
+            tacticalBackgroundDaemon.stop();
+          }
+        }}
+        soundAlertEnabled={soundAlertEnabled}
+        onToggleSoundAlert={setSoundAlertEnabled}
+        isInstallable={isInstallable}
+        isInstalled={isInstalled}
+        isIOS={isIOS}
+        onPromptInstall={promptInstall}
+        wsSignalConnected={wsSignalConnected}
+        activePeersCount={contacts.filter((c) => c.connectionState === 'CONNECTED').length}
+      />
 
       {/* Modal 1: Admin HP Only Provisioning (+ Buat QR & Link Personel Baru) */}
       <AdminProvisioningModal
@@ -4174,15 +4892,34 @@ export default function App() {
       {/* Incoming Live Call Alert Overlay (WhatsApp Style) */}
       {incomingCallInvite && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
-          <div className="w-full max-w-sm rounded-2xl bg-[#031525] border-2 border-[#00f0ff]/60 shadow-[0_0_40px_rgba(0,240,255,0.25)] p-6 text-center space-y-5">
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#00f0ff]/15 border border-[#00f0ff]/40 text-[#00f0ff] text-xs font-mono">
-              <span className="w-2 h-2 rounded-full bg-[#00f0ff] animate-ping" />
+          <div
+            className="w-full max-w-sm rounded-2xl border-2 shadow-2xl p-6 text-center space-y-5"
+            style={{
+              backgroundColor: 'var(--slk-bg-card)',
+              borderColor: 'var(--slk-accent)',
+            }}
+          >
+            <div
+              className="inline-flex items-center gap-2 px-3 py-1 rounded-full border text-xs font-mono"
+              style={{
+                backgroundColor: 'var(--slk-accent-muted)',
+                borderColor: 'var(--slk-accent)',
+                color: 'var(--slk-accent)',
+              }}
+            >
+              <span
+                className="w-2 h-2 rounded-full animate-ping"
+                style={{ backgroundColor: 'var(--slk-accent)' }}
+              />
               {incomingCallInvite.callType === 'video'
                 ? 'PANGGILAN VIDEO P2P MASUK'
                 : 'PANGGILAN SUARA P2P MASUK'}
             </div>
 
-            <div className="w-20 h-20 rounded-full mx-auto bg-gradient-to-br from-cyan-400 to-blue-800 flex items-center justify-center text-white font-bold text-2xl shadow-lg border-2 border-[#00f0ff]/50 animate-pulse">
+            <div
+              className="w-20 h-20 rounded-full mx-auto bg-gradient-to-br from-cyan-400 to-blue-800 flex items-center justify-center text-white font-bold text-2xl shadow-lg border-2 animate-pulse"
+              style={{ borderColor: 'var(--slk-accent)' }}
+            >
               {getInitials(incomingCallInvite.callerName)}
             </div>
 
@@ -4190,10 +4927,13 @@ export default function App() {
               <h3 className="text-lg font-bold text-white">
                 {incomingCallInvite.callerName}
               </h3>
-              <p className="text-xs text-[#00f0ff] font-medium mt-0.5">
+              <p className="text-xs font-medium mt-0.5" style={{ color: 'var(--slk-accent)' }}>
                 {incomingCallInvite.callerRank} · NRP {incomingCallInvite.callerNrp}
               </p>
-              <p className="text-[11px] font-mono text-[#7aa2c4] mt-1">
+              <p
+                className="text-[11px] font-mono mt-1"
+                style={{ color: 'var(--slk-text-secondary)' }}
+              >
                 ID: {incomingCallInvite.fromPeerId}
               </p>
             </div>
