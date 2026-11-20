@@ -1,0 +1,6 @@
+{
+  "name": "SILENT LINK DISKOMLEKAU",
+  "description": "Sistem komunikasi instan Peer-to-Peer (P2P) taktis militer berbasis WebRTC Data Channel dan End-to-End Encryption (AES-256-GCM / ECDH P-256) dengan prinsip Zero-Data Retention.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
