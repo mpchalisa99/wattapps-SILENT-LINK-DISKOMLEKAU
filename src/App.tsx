@@ -84,6 +84,7 @@ import {
   BackgroundKeepAliveStatus,
   sendBackgroundSystemNotification,
 } from './utils/pwaAndKeepAliveEngine';
+import { TacticalCrossDeviceSignalingSocket } from './utils/crossDeviceSignaling';
 import { ManualSdpModal } from './components/ManualSdpModal';
 import {
   TacticalMediaStreamModal,
@@ -304,7 +305,12 @@ export default function App() {
     targetPeerId: string;
     targetCallsign: string;
   } | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const wsRef = useRef<TacticalCrossDeviceSignalingSocket | null>(null);
+  const pendingAutoDialPeerRef = useRef<{
+    peerId: string;
+    callsign: string;
+    nrp: string;
+  } | null>(null);
   const localIdentityRef = useRef<LocalNodeIdentity>(localIdentity);
   localIdentityRef.current = localIdentity;
 
@@ -937,7 +943,7 @@ export default function App() {
           voiceMeta?: VoiceNoteMeta;
         } = JSON.parse(decryptedJson);
 
-        // Send DELIVERY_ACK (VERIFIED) back via open RTCDataChannel AND WebSocket E2EE relay
+        // Send DELIVERY_ACK (VERIFIED) directly P2P via open RTCDataChannel (zero broker relay when open)
         const ackPacket: DataChannelPacket = {
           packetType: 'DELIVERY_ACK',
           messageId: packet.messageId,
@@ -948,13 +954,13 @@ export default function App() {
           ackStage: 'VERIFIED',
         };
 
-        sendOverReliableDataChannel(
+        const ackResult = sendOverReliableDataChannel(
           tunnel,
           JSON.stringify(ackPacket),
           recordIceDiagnosticLog
         );
 
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        if (!ackResult.sentImmediately && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(
             JSON.stringify({
               type: 'e2ee:ack',
@@ -1467,6 +1473,11 @@ export default function App() {
       setLocalIdentity(newIdentity);
 
       const targetAdminPeerId = verifiedCred.adminPeerId || 'SLK-ADM-526316-0001';
+      pendingAutoDialPeerRef.current = {
+        peerId: targetAdminPeerId,
+        callsign: 'Kolonel Lek Yudhi Eko Santoso',
+        nrp: '526316',
+      };
 
       // Pre-derive shared AES-256-GCM key with Admin's ECDH Public Key from QR credential
       let adminSharedKeyHash = 'DERIVING ECDH...';
@@ -1490,7 +1501,7 @@ export default function App() {
           existingAdminTunnel.remoteFingerprint = verifiedCred.adminFingerprint;
           livePeerTunnelsRef.current.set(targetAdminPeerId, existingAdminTunnel);
         } catch {
-          // Will re-derive on directory:sync
+          // Will re-derive on directory:sync or SDP answer
         }
       }
 
@@ -1513,7 +1524,7 @@ export default function App() {
         sharedKeyHash: adminSharedKeyHash,
         latencyMs: 5,
         unreadCount: 0,
-        lastMessagePreview: `Otorisasi QR ID ${verifiedCred.assignedPeerId} aktif. Menghubungkan DataChannel P2P...`,
+        lastMessagePreview: `Auto-Dial P2P ID ${verifiedCred.assignedPeerId} -> ${targetAdminPeerId} aktif...`,
         lastActivityTime: Date.now(),
         provisionedByAdmin: true,
         autoResponderProfile: 'hq',
@@ -1525,25 +1536,34 @@ export default function App() {
       ]);
       setOpenChatPeerId(adminContact.peerId);
 
-      // Immediately register this Operative node on the live WebSocket signaling server
+      // Immediately register this Operative node on the Cross-Device Signaling Broker (MQTT WSS + PeerJS)
       sendNodeRegistration(newIdentity);
 
-      // Proactively initiate WebRTC SDP Offer + ICE gathering to Admin HP if WebSocket is already open
-      window.setTimeout(() => {
+      // Auto-Dial Admin HP across cellular/internet with multi-step retry until DataChannel opens
+      const triggerAutoDial = () => {
+        const currentTunnel = livePeerTunnelsRef.current.get(targetAdminPeerId);
+        if (currentTunnel?.dc?.readyState === 'open') {
+          return;
+        }
+        sendNodeRegistration(localIdentityRef.current);
         initiateLiveWebRTCOffer(
           targetAdminPeerId,
           'Kolonel Lek Yudhi Eko Santoso',
           '526316'
         );
-      }, 250);
+      };
+
+      window.setTimeout(triggerAutoDial, 200);
+      window.setTimeout(triggerAutoDial, 1600);
+      window.setTimeout(triggerAutoDial, 3800);
     },
     [initiateLiveWebRTCOffer, sendNodeRegistration]
   );
 
-  // Initialize Master Admin ECDH P-256 + ECDSA P-256 Keypairs, Check URL for QR Link Onboarding, and Connect Persistent WebSocket
+  // Initialize Master Admin ECDH P-256 + ECDSA P-256 Keypairs, Check URL for ?join= / ?invite= QR Link Onboarding, and Connect Cross-Device Signaling
   useEffect(() => {
     let isMounted = true;
-    let reconnectTimer: number | null = null;
+    let autoDialInterval: number | null = null;
 
     const initSystem = async () => {
       const ecdh = await generateEphemeralECDHKeyPair();
@@ -1561,159 +1581,136 @@ export default function App() {
       localIdentityRef.current = initialAdminIdentity;
       setLocalIdentity(initialAdminIdentity);
 
-      // Check if launched via Admin-generated QR Code Link (?invite=SLK-ID-...) or Encrypted Deep Link (?silentlink_token=SLK2...)
-      const params = new URLSearchParams(window.location.search);
-      const inviteIdParam = params.get('invite');
-      const deepLinkToken = params.get('silentlink_token');
-      if (inviteIdParam || deepLinkToken) {
-        try {
-          const verifiedCred = await verifyAndParseProvisioningToken(
-            inviteIdParam ? window.location.href : deepLinkToken!
-          );
-          window.history.replaceState({}, document.title, window.location.pathname);
-          await handleCompleteOperativeOnboarding(verifiedCred);
-        } catch {
-          // Continue normal initialization if invalid
-        }
-      } else {
-        // Pre-connect initial preset contact via loopback WebRTC DataChannel
-        const firstContact = INITIAL_TACTICAL_CONTACTS[0];
-        await establishLoopbackWebRTCTunnel(firstContact, {
-          privateKey: ecdh.privateKey,
-          publicKeyJwk: ecdh.publicKeyJwk,
-          fingerprint: ecdh.fingerprint,
-        });
-      }
+      // 1. Connect Cross-Device Signaling Bus (MQTT over WSS + PeerJS Cloud) FIRST so outgoing registration & auto-dial queue/fire immediately
+      const ws = new TacticalCrossDeviceSignalingSocket();
+      wsRef.current = ws;
 
-      // Connect to Zero-Retention WebSocket Signaling Relay for cross-device / cross-client P2P communication
-      const connectSignalingWebSocket = () => {
+      ws.onopen = () => {
         if (!isMounted) return;
-        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${proto}//${window.location.host}/ws-signal`;
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
+        setWsSignalConnected(true);
+        sendNodeRegistration(localIdentityRef.current);
 
-        ws.onopen = () => {
-          if (!isMounted) return;
-          setWsSignalConnected(true);
-          sendNodeRegistration(localIdentityRef.current);
-        };
+        // If client joined via QR/Link (?join=...), immediately auto-dial Admin HP once signaling broker is online
+        if (pendingAutoDialPeerRef.current) {
+          const target = pendingAutoDialPeerRef.current;
+          window.setTimeout(() => {
+            initiateLiveWebRTCOffer(target.peerId, target.callsign, target.nrp);
+          }, 150);
+        }
+      };
 
-        ws.onclose = () => {
-          if (!isMounted) return;
-          setWsSignalConnected(false);
-          reconnectTimer = window.setTimeout(connectSignalingWebSocket, 2000);
-        };
+      ws.onclose = () => {
+        if (!isMounted) return;
+        setWsSignalConnected(false);
+      };
 
-        ws.onmessage = async (event) => {
-          try {
-            const msg = JSON.parse(event.data);
+      ws.onmessage = async (event) => {
+        try {
+          const msg = JSON.parse(event.data);
 
-            // 0. Server-assigned collision-safe ID if a 2nd browser tab connected before scanning QR
-            if (msg.type === 'node:assigned-id' && msg.peerId) {
-              if (localIdentityRef.current.role === 'ADMIN') {
-                const updated = {
-                  ...localIdentityRef.current,
-                  peerId: String(msg.peerId),
-                };
-                localIdentityRef.current = updated;
-                setLocalIdentity(updated);
-              }
-              return;
+          // 0. Server-assigned collision-safe ID if a 2nd browser tab connected before scanning QR
+          if (msg.type === 'node:assigned-id' && msg.peerId) {
+            if (localIdentityRef.current.role === 'ADMIN') {
+              const updated = {
+                ...localIdentityRef.current,
+                peerId: String(msg.peerId),
+              };
+              localIdentityRef.current = updated;
+              setLocalIdentity(updated);
             }
+            return;
+          }
 
-            // 1. Live Peer Directory Sync & Immediate ECDH P-256 Shared Key Derivation
-            if (msg.type === 'directory:sync' && Array.isArray(msg.peers)) {
-              const remoteNodes: Array<{
-                peerId: string;
-                callsign: string;
-                nrp?: string;
-                unit: string;
-                rank: string;
-                role?: string;
-                publicKeyJwk?: JsonWebKey;
-                fingerprint?: string;
-              }> = msg.peers.filter(
-                (p: { peerId: string }) => p.peerId !== localIdentityRef.current.peerId
-              );
+          // 1. Live Peer Directory Sync & Immediate ECDH P-256 Shared Key Derivation
+          if (msg.type === 'directory:sync' && Array.isArray(msg.peers)) {
+            const remoteNodes: Array<{
+              peerId: string;
+              callsign: string;
+              nrp?: string;
+              unit: string;
+              rank: string;
+              role?: string;
+              publicKeyJwk?: JsonWebKey;
+              fingerprint?: string;
+            }> = msg.peers.filter(
+              (p: { peerId: string }) => p.peerId !== localIdentityRef.current.peerId
+            );
 
-              const activePrivateKey = localIdentityRef.current.privateKey;
-              const activePublicKeyJwk = localIdentityRef.current.publicKeyJwk;
+            const activePrivateKey = localIdentityRef.current.privateKey;
+            const activePublicKeyJwk = localIdentityRef.current.publicKeyJwk;
 
-              const derivedMap = new Map<
-                string,
-                { sharedKeyHash: string; remoteFingerprint: string }
-              >();
+            const derivedMap = new Map<
+              string,
+              { sharedKeyHash: string; remoteFingerprint: string }
+            >();
 
-              if (activePrivateKey) {
-                for (const rn of remoteNodes) {
-                  const rnNrp = rn.nrp || rn.peerId.split('-')[2] || rn.peerId.slice(-6);
-                  if (rn.publicKeyJwk) {
-                    try {
-                      const remoteFp =
-                        rn.fingerprint || (await computeJwkFingerprint(rn.publicKeyJwk));
+            if (activePrivateKey) {
+              for (const rn of remoteNodes) {
+                const rnNrp = rn.nrp || rn.peerId.split('-')[2] || rn.peerId.slice(-6);
+                if (rn.publicKeyJwk) {
+                  try {
+                    const remoteFp =
+                      rn.fingerprint || (await computeJwkFingerprint(rn.publicKeyJwk));
 
-                      let tunnel = livePeerTunnelsRef.current.get(rn.peerId);
-                      if (!tunnel) {
-                        tunnel = createEmptyLivePeerTunnel(
-                          rn.peerId,
-                          rn.callsign,
-                          rnNrp
-                        );
-                        livePeerTunnelsRef.current.set(rn.peerId, tunnel);
-                      } else {
-                        tunnel.peerName = rn.callsign || tunnel.peerName;
-                        tunnel.peerNrp = rnNrp || tunnel.peerNrp;
-                      }
+                    let tunnel = livePeerTunnelsRef.current.get(rn.peerId);
+                    if (!tunnel) {
+                      tunnel = createEmptyLivePeerTunnel(
+                        rn.peerId,
+                        rn.callsign,
+                        rnNrp
+                      );
+                      livePeerTunnelsRef.current.set(rn.peerId, tunnel);
+                    } else {
+                      tunnel.peerName = rn.callsign || tunnel.peerName;
+                      tunnel.peerNrp = rnNrp || tunnel.peerNrp;
+                    }
 
+                    if (
+                      !tunnel.sharedKey ||
+                      tunnel.remotePublicKeyJwk?.x !== rn.publicKeyJwk.x
+                    ) {
+                      const derived = await deriveSharedAESGCMKey(
+                        activePrivateKey,
+                        rn.publicKeyJwk
+                      );
+                      tunnel.sharedKey = derived.sharedKey;
+                      tunnel.remotePublicKeyJwk = rn.publicKeyJwk;
+                      tunnel.sharedKeyHash = derived.sharedKeyHash;
+                      tunnel.remoteFingerprint = remoteFp;
+                    }
+
+                    derivedMap.set(rn.peerId, {
+                      sharedKeyHash: tunnel.sharedKeyHash,
+                      remoteFingerprint: tunnel.remoteFingerprint,
+                    });
+
+                    // Close any local loopback auto-responder for this live peer ID
+                    const oldLoopback = loopbackTunnelsRef.current.get(rn.peerId);
+                    if (oldLoopback) {
+                      oldLoopback.localDc.close();
+                      oldLoopback.localPc.close();
+                      oldLoopback.remotePc.close();
+                      loopbackTunnelsRef.current.delete(rn.peerId);
+                    }
+
+                    // Operative (or peer with higher ID) auto-dials immediately; Admin waits 1.2s for Client's auto-dial first
+                    const needsConnection =
+                      activePublicKeyJwk &&
+                      (!tunnel.dc || tunnel.dc.readyState !== 'open') &&
+                      (!tunnel.pc ||
+                        tunnel.pc.connectionState === 'new' ||
+                        tunnel.pc.connectionState === 'closed' ||
+                        tunnel.pc.connectionState === 'failed' ||
+                        tunnel.pc.iceConnectionState === 'disconnected' ||
+                        tunnel.pc.iceConnectionState === 'failed');
+
+                    if (needsConnection) {
                       if (
-                        !tunnel.sharedKey ||
-                        tunnel.remotePublicKeyJwk?.x !== rn.publicKeyJwk.x
+                        localIdentityRef.current.role === 'OPERATIVE' ||
+                        localIdentityRef.current.peerId > rn.peerId
                       ) {
-                        const derived = await deriveSharedAESGCMKey(
-                          activePrivateKey,
-                          rn.publicKeyJwk
-                        );
-                        tunnel.sharedKey = derived.sharedKey;
-                        tunnel.remotePublicKeyJwk = rn.publicKeyJwk;
-                        tunnel.sharedKeyHash = derived.sharedKeyHash;
-                        tunnel.remoteFingerprint = remoteFp;
-                      }
-
-                      derivedMap.set(rn.peerId, {
-                        sharedKeyHash: tunnel.sharedKeyHash,
-                        remoteFingerprint: tunnel.remoteFingerprint,
-                      });
-
-                      // Close any local loopback auto-responder for this live peer ID
-                      const oldLoopback = loopbackTunnelsRef.current.get(rn.peerId);
-                      if (oldLoopback) {
-                        oldLoopback.localDc.close();
-                        oldLoopback.localPc.close();
-                        oldLoopback.remotePc.close();
-                        loopbackTunnelsRef.current.delete(rn.peerId);
-                      }
-
-                      // Initiate WebRTC DataChannel Offer if not yet open
-                      const shouldInitiateOffer =
-                        activePublicKeyJwk &&
-                        (!tunnel.dc || tunnel.dc.readyState !== 'open') &&
-                        (!tunnel.pc ||
-                          tunnel.pc.connectionState === 'new' ||
-                          tunnel.pc.connectionState === 'closed' ||
-                          tunnel.pc.connectionState === 'failed' ||
-                          tunnel.pc.iceConnectionState === 'disconnected' ||
-                          tunnel.pc.iceConnectionState === 'failed') &&
-                        localIdentityRef.current.peerId < rn.peerId;
-
-                      if (shouldInitiateOffer) {
                         initiateLiveWebRTCOffer(rn.peerId, rn.callsign, rnNrp);
-                      } else if (
-                        activePublicKeyJwk &&
-                        (!tunnel.dc || tunnel.dc.readyState !== 'open') &&
-                        !tunnel.pc
-                      ) {
-                        // Fallback timer: if remote peer hasn't sent an offer within 1.4s, initiate from our side
+                      } else {
                         const targetPid = rn.peerId;
                         const targetCs = rn.callsign;
                         window.setTimeout(() => {
@@ -1725,249 +1722,341 @@ export default function App() {
                           ) {
                             initiateLiveWebRTCOffer(targetPid, targetCs, rnNrp);
                           }
-                        }, 1400);
+                        }, 1300);
                       }
-                    } catch {
-                      // Ignore key derivation error
                     }
-                  }
-                }
-              }
-
-              setContacts((prev) => {
-                const updatedList = [...prev];
-
-                for (const rn of remoteNodes) {
-                  const rnNrp = rn.nrp || rn.peerId.split('-')[2] || rn.peerId.slice(-6);
-                  const cryptoMeta = derivedMap.get(rn.peerId);
-                  const currentTunnel = livePeerTunnelsRef.current.get(rn.peerId);
-                  const currentDcState = currentTunnel?.dc?.readyState || 'connecting';
-                  const currentIceState =
-                    currentTunnel?.pc?.iceConnectionState || 'checking';
-
-                  const matchIdx = updatedList.findIndex(
-                    (c) =>
-                      c.peerId === rn.peerId ||
-                      (!c.isGroup && c.nrp === rnNrp && c.provisionedByAdmin)
-                  );
-
-                  if (matchIdx !== -1) {
-                    const existing = updatedList[matchIdx];
-                    updatedList[matchIdx] = {
-                      ...existing,
-                      peerId: rn.peerId,
-                      personnelName: rn.callsign || existing.personnelName,
-                      nrp: rnNrp,
-                      unit: rn.unit || existing.unit,
-                      rank: rn.rank || existing.rank,
-                      mode: 'live-peer',
-                      connectionState: 'CONNECTED',
-                      iceState:
-                        currentDcState === 'open' ? 'connected' : currentIceState,
-                      dataChannelState: currentDcState,
-                      remoteFingerprint:
-                        cryptoMeta?.remoteFingerprint ||
-                        rn.fingerprint ||
-                        existing.remoteFingerprint,
-                      sharedKeyHash:
-                        cryptoMeta?.sharedKeyHash || existing.sharedKeyHash,
-                      latencyMs: 6,
-                    };
-                  } else {
-                    updatedList.unshift({
-                      peerId: rn.peerId,
-                      personnelName: rn.callsign,
-                      nrp: rnNrp,
-                      callsign: `${rn.callsign} [LIVE P2P]`,
-                      unit: rn.unit || 'DISKOMLEKAU',
-                      rank: rn.rank || 'Personel Aktif',
-                      frequency: 'DIRECT WEBRTC P2P',
-                      sector: 'Multi-Client Live P2P',
-                      mode: 'live-peer',
-                      isGroup: false,
-                      avatarColor: 'from-cyan-400 to-teal-700',
-                      connectionState: 'CONNECTED',
-                      iceState:
-                        currentDcState === 'open' ? 'connected' : currentIceState,
-                      dataChannelState: currentDcState,
-                      remoteFingerprint:
-                        cryptoMeta?.remoteFingerprint ||
-                        rn.fingerprint ||
-                        'ECDH-P256-VERIFIED',
-                      sharedKeyHash: cryptoMeta?.sharedKeyHash || 'AES-256-GCM-OK',
-                      latencyMs: 6,
-                      unreadCount: 1,
-                      lastMessagePreview:
-                        'Terhubung langsung P2P E2EE (Chat, Suara & Video Siap).',
-                      lastActivityTime: Date.now(),
-                      provisionedByAdmin: true,
-                    });
-                  }
-                }
-
-                return updatedList;
-              });
-            }
-
-            // 2. Direct E2EE Encrypted Packet Relay (Chat, Photo, Document, Voice Note)
-            if (
-              (msg.type === 'e2ee:packet' || msg.type === 'e2ee:group-packet') &&
-              msg.packet
-            ) {
-              await processIncomingLiveEncryptedPacket(msg.packet as DataChannelPacket);
-            }
-
-            // 3. Delivery & Decryption Verification Ack
-            if (msg.type === 'e2ee:ack' && msg.packet) {
-              const ack = msg.packet as DataChannelPacket;
-              if (ack.ackStage) {
-                updateMessageStatus(ack.senderPeerId, ack.messageId, ack.ackStage);
-              }
-            }
-
-            // 4. Live Ephemeral SITREP Status Broadcast
-            if (msg.type === 'status:broadcast' && msg.statusItem) {
-              const incomingStatus = msg.statusItem as EphemeralStatusUpdate;
-              setStatusUpdates((prev) => {
-                if (prev.some((s) => s.id === incomingStatus.id)) return prev;
-                return [incomingStatus, ...prev];
-              });
-            }
-
-            // 5. Live Multi-Client Voice Call & Video Call Invitation
-            if (msg.type === 'call:invite' && msg.fromPeerId) {
-              const cType = msg.callType === 'video' ? 'video' : 'voice';
-              setIncomingCallInvite({
-                fromPeerId: msg.fromPeerId,
-                callerName: msg.callerName || `Personel ${msg.fromPeerId}`,
-                callerNrp: msg.callerNrp || msg.fromPeerId.slice(-6),
-                callerRank: msg.callerRank || 'Personel Aktif',
-                callType: cType,
-                timestamp: Date.now(),
-              });
-              void sendBackgroundSystemNotification(
-                `PANGGILAN ${cType === 'video' ? 'VIDEO' : 'SUARA'} P2P MASUK`,
-                `${msg.callerName || msg.fromPeerId} (${msg.callerRank || 'Personel'}) memanggil...`,
-                soundAlertEnabledRef.current,
-                'call'
-              );
-              setCallHistory((prev) => [
-                {
-                  id: `CALL-${Date.now()}`,
-                  contactPeerId: msg.fromPeerId,
-                  personnelName: msg.callerName || `Personel ${msg.fromPeerId}`,
-                  rank: msg.callerRank || 'Personel Aktif',
-                  nrp: msg.callerNrp || msg.fromPeerId.slice(-6),
-                  timestamp: Date.now(),
-                  callType: cType,
-                  direction: 'incoming',
-                },
-                ...prev,
-              ]);
-            }
-
-            // 6. Live Call Signaling & Media Frame Relay
-            if (
-              msg.type === 'call:accept' ||
-              msg.type === 'call:reject' ||
-              msg.type === 'call:hangup' ||
-              msg.type === 'call:webrtc-offer' ||
-              msg.type === 'call:webrtc-answer' ||
-              msg.type === 'call:webrtc-ice' ||
-              msg.type === 'call:media-frame'
-            ) {
-              if (msg.type === 'call:hangup' || msg.type === 'call:reject') {
-                setIncomingCallInvite((prev) =>
-                  prev && prev.fromPeerId === msg.fromPeerId ? null : prev
-                );
-              }
-              setLatestCallSignal({
-                ...msg,
-                timestamp: Date.now(),
-              } as LiveCallSignalPacket);
-            }
-
-            // 7. Precision WebRTC DataChannel SDP Handshake & ICE Candidate Gathering
-            if (msg.type === 'webrtc:offer' && msg.fromPeerId && msg.sdp && msg.publicKeyJwk) {
-              const fromPeerId: string = msg.fromPeerId;
-              const fromCallsign: string = msg.fromCallsign || `Personel-${fromPeerId}`;
-              const fromNrp: string = msg.fromNrp || fromPeerId.slice(-6);
-              const remotePubJwk: JsonWebKey = msg.publicKeyJwk;
-
-              // CRITICAL: Synchronously create or lock tunnel BEFORE any async await so early trickle ICE candidates are queued!
-              let tunnel = livePeerTunnelsRef.current.get(fromPeerId);
-              if (!tunnel) {
-                tunnel = createEmptyLivePeerTunnel(fromPeerId, fromCallsign, fromNrp);
-                livePeerTunnelsRef.current.set(fromPeerId, tunnel);
-              }
-              tunnel.peerName = fromCallsign;
-              tunnel.peerNrp = fromNrp;
-              tunnel.isSettingRemoteDescription = true;
-
-              const isPolite = localIdentityRef.current.peerId > fromPeerId;
-              const offerCollision =
-                tunnel.makingOffer ||
-                (tunnel.pc && tunnel.pc.signalingState !== 'stable');
-
-              if (offerCollision && !isPolite && !msg.iceRestart) {
-                tunnel.isSettingRemoteDescription = false;
-                return;
-              }
-
-              // Reuse existing PC on ICE Restart if signaling allows, otherwise create fresh RTCPeerConnection
-              let pc = tunnel.pc;
-              if (!pc || pc.signalingState === 'closed' || (!msg.iceRestart && !offerCollision)) {
-                if (pc) {
-                  try {
-                    pc.close();
                   } catch {
-                    // Ignore
+                    // Ignore key derivation error
                   }
                 }
-                pc = new RTCPeerConnection(TACTICAL_ICE_CONFIG);
-                tunnel.pc = pc;
-                tunnel.localGatheredCandidates = [];
-                tunnel.localCandidatesSent = 0;
-                attachLivePeerConnectionListeners(pc, tunnel);
+              }
+            }
+
+            setContacts((prev) => {
+              const updatedList = [...prev];
+
+              for (const rn of remoteNodes) {
+                const rnNrp = rn.nrp || rn.peerId.split('-')[2] || rn.peerId.slice(-6);
+                const cryptoMeta = derivedMap.get(rn.peerId);
+                const currentTunnel = livePeerTunnelsRef.current.get(rn.peerId);
+                const currentDcState = currentTunnel?.dc?.readyState || 'connecting';
+                const currentIceState =
+                  currentTunnel?.pc?.iceConnectionState || 'checking';
+                const isChannelOpen = currentDcState === 'open';
+
+                const matchIdx = updatedList.findIndex(
+                  (c) =>
+                    c.peerId === rn.peerId ||
+                    (!c.isGroup && c.nrp === rnNrp && c.provisionedByAdmin)
+                );
+
+                if (matchIdx !== -1) {
+                  const existing = updatedList[matchIdx];
+                  updatedList[matchIdx] = {
+                    ...existing,
+                    peerId: rn.peerId,
+                    personnelName: rn.callsign || existing.personnelName,
+                    nrp: rnNrp,
+                    unit: rn.unit || existing.unit,
+                    rank: rn.rank || existing.rank,
+                    mode: 'live-peer',
+                    connectionState: isChannelOpen ? 'CONNECTED' : 'HANDSHAKING',
+                    iceState: isChannelOpen ? 'connected' : currentIceState,
+                    dataChannelState: currentDcState,
+                    remoteFingerprint:
+                      cryptoMeta?.remoteFingerprint ||
+                      rn.fingerprint ||
+                      existing.remoteFingerprint,
+                    sharedKeyHash:
+                      cryptoMeta?.sharedKeyHash || existing.sharedKeyHash,
+                    latencyMs: 6,
+                  };
+                } else {
+                  updatedList.unshift({
+                    peerId: rn.peerId,
+                    personnelName: rn.callsign,
+                    nrp: rnNrp,
+                    callsign: `${rn.callsign} [LIVE P2P]`,
+                    unit: rn.unit || 'DISKOMLEKAU',
+                    rank: rn.rank || 'Personel Aktif',
+                    frequency: 'DIRECT WEBRTC P2P',
+                    sector: 'Multi-Client Live P2P',
+                    mode: 'live-peer',
+                    isGroup: false,
+                    avatarColor: 'from-cyan-400 to-teal-700',
+                    connectionState: isChannelOpen ? 'CONNECTED' : 'HANDSHAKING',
+                    iceState: isChannelOpen ? 'connected' : currentIceState,
+                    dataChannelState: currentDcState,
+                    remoteFingerprint:
+                      cryptoMeta?.remoteFingerprint ||
+                      rn.fingerprint ||
+                      'ECDH-P256-VERIFIED',
+                    sharedKeyHash: cryptoMeta?.sharedKeyHash || 'AES-256-GCM-OK',
+                    latencyMs: 6,
+                    unreadCount: 1,
+                    lastMessagePreview:
+                      'Terhubung langsung P2P E2EE (Chat, Suara & Video Siap).',
+                    lastActivityTime: Date.now(),
+                    provisionedByAdmin: true,
+                  });
+                }
               }
 
-              const remoteFp = await computeJwkFingerprint(remotePubJwk);
-              const myPrivKey = localIdentityRef.current.privateKey || ecdh.privateKey;
-              const myPubJwk = localIdentityRef.current.publicKeyJwk || ecdh.publicKeyJwk;
+              return updatedList;
+            });
+          }
 
-              const { sharedKey, sharedKeyHash } = await deriveSharedAESGCMKey(
-                myPrivKey,
-                remotePubJwk
+          // 2. Direct E2EE Encrypted Packet Relay (Fallback only while DataChannel is negotiating / Group broadcast)
+          if (
+            (msg.type === 'e2ee:packet' || msg.type === 'e2ee:group-packet') &&
+            msg.packet
+          ) {
+            await processIncomingLiveEncryptedPacket(msg.packet as DataChannelPacket);
+          }
+
+          // 3. Delivery & Decryption Verification Ack
+          if (msg.type === 'e2ee:ack' && msg.packet) {
+            const ack = msg.packet as DataChannelPacket;
+            if (ack.ackStage) {
+              updateMessageStatus(ack.senderPeerId, ack.messageId, ack.ackStage);
+            }
+          }
+
+          // 4. Live Ephemeral SITREP Status Broadcast
+          if (msg.type === 'status:broadcast' && msg.statusItem) {
+            const incomingStatus = msg.statusItem as EphemeralStatusUpdate;
+            setStatusUpdates((prev) => {
+              if (prev.some((s) => s.id === incomingStatus.id)) return prev;
+              return [incomingStatus, ...prev];
+            });
+          }
+
+          // 5. Live Multi-Client Voice Call & Video Call Invitation
+          if (msg.type === 'call:invite' && msg.fromPeerId) {
+            const cType = msg.callType === 'video' ? 'video' : 'voice';
+            setIncomingCallInvite({
+              fromPeerId: msg.fromPeerId,
+              callerName: msg.callerName || `Personel ${msg.fromPeerId}`,
+              callerNrp: msg.callerNrp || msg.fromPeerId.slice(-6),
+              callerRank: msg.callerRank || 'Personel Aktif',
+              callType: cType,
+              timestamp: Date.now(),
+            });
+            void sendBackgroundSystemNotification(
+              `PANGGILAN ${cType === 'video' ? 'VIDEO' : 'SUARA'} P2P MASUK`,
+              `${msg.callerName || msg.fromPeerId} (${msg.callerRank || 'Personel'}) memanggil...`,
+              soundAlertEnabledRef.current,
+              'call'
+            );
+            setCallHistory((prev) => [
+              {
+                id: `CALL-${Date.now()}`,
+                contactPeerId: msg.fromPeerId,
+                personnelName: msg.callerName || `Personel ${msg.fromPeerId}`,
+                rank: msg.callerRank || 'Personel Aktif',
+                nrp: msg.callerNrp || msg.fromPeerId.slice(-6),
+                timestamp: Date.now(),
+                callType: cType,
+                direction: 'incoming',
+              },
+              ...prev,
+            ]);
+          }
+
+          // 6. Live Call Signaling & Media Frame Relay
+          if (
+            msg.type === 'call:accept' ||
+            msg.type === 'call:reject' ||
+            msg.type === 'call:hangup' ||
+            msg.type === 'call:webrtc-offer' ||
+            msg.type === 'call:webrtc-answer' ||
+            msg.type === 'call:webrtc-ice' ||
+            msg.type === 'call:media-frame'
+          ) {
+            if (msg.type === 'call:hangup' || msg.type === 'call:reject') {
+              setIncomingCallInvite((prev) =>
+                prev && prev.fromPeerId === msg.fromPeerId ? null : prev
               );
+            }
+            setLatestCallSignal({
+              ...msg,
+              timestamp: Date.now(),
+            } as LiveCallSignalPacket);
+          }
 
-              tunnel.sharedKey = sharedKey;
-              tunnel.remotePublicKeyJwk = remotePubJwk;
-              tunnel.sharedKeyHash = sharedKeyHash;
-              tunnel.remoteFingerprint = remoteFp;
+          // 7. Precision WebRTC DataChannel SDP Handshake & ICE Candidate Gathering
+          if (msg.type === 'webrtc:offer' && msg.fromPeerId && msg.sdp && msg.publicKeyJwk) {
+            const fromPeerId: string = msg.fromPeerId;
+            const fromCallsign: string = msg.fromCallsign || `Personel-${fromPeerId}`;
+            const fromNrp: string = msg.fromNrp || fromPeerId.split('-')[2] || fromPeerId.slice(-6);
+            const remotePubJwk: JsonWebKey = msg.publicKeyJwk;
 
-              pc.ondatachannel = (dcEvent) => {
-                tunnel!.dc = dcEvent.channel;
-                setupLivePeerDataChannel(
-                  fromPeerId,
-                  fromCallsign,
-                  fromNrp,
-                  pc!,
-                  dcEvent.channel,
-                  sharedKey,
-                  sharedKeyHash,
-                  remoteFp
-                );
-              };
+            // Close any local loopback auto-responder for this live peer
+            const oldLoopback = loopbackTunnelsRef.current.get(fromPeerId);
+            if (oldLoopback) {
+              oldLoopback.localDc.close();
+              oldLoopback.localPc.close();
+              oldLoopback.remotePc.close();
+              loopbackTunnelsRef.current.delete(fromPeerId);
+            }
 
-              try {
-                if (pc.signalingState !== 'stable') {
-                  await pc.setLocalDescription({ type: 'rollback' });
+            // CRITICAL: Synchronously create or lock tunnel BEFORE any async await so early trickle ICE candidates are queued!
+            let tunnel = livePeerTunnelsRef.current.get(fromPeerId);
+            if (!tunnel) {
+              tunnel = createEmptyLivePeerTunnel(fromPeerId, fromCallsign, fromNrp);
+              livePeerTunnelsRef.current.set(fromPeerId, tunnel);
+            }
+            tunnel.peerName = fromCallsign;
+            tunnel.peerNrp = fromNrp;
+            tunnel.isSettingRemoteDescription = true;
+
+            const isPolite = localIdentityRef.current.peerId > fromPeerId;
+            const offerCollision =
+              tunnel.makingOffer ||
+              (tunnel.pc && tunnel.pc.signalingState !== 'stable');
+
+            if (offerCollision && !isPolite && !msg.iceRestart) {
+              tunnel.isSettingRemoteDescription = false;
+              return;
+            }
+
+            // Create a clean RTCPeerConnection(TACTICAL_ICE_CONFIG) for incoming offer (or reuse on ICE restart)
+            let pc = tunnel.pc;
+            if (!pc || pc.signalingState === 'closed' || !msg.iceRestart || offerCollision) {
+              if (pc) {
+                try {
+                  pc.close();
+                } catch {
+                  // Ignore
                 }
-                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-                tunnel.isSettingRemoteDescription = false;
+              }
+              pc = new RTCPeerConnection(TACTICAL_ICE_CONFIG);
+              tunnel.pc = pc;
+              tunnel.localGatheredCandidates = [];
+              tunnel.localCandidatesSent = 0;
+              attachLivePeerConnectionListeners(pc, tunnel);
+            }
+
+            const remoteFp = await computeJwkFingerprint(remotePubJwk);
+            const myPrivKey = localIdentityRef.current.privateKey || ecdh.privateKey;
+            const myPubJwk = localIdentityRef.current.publicKeyJwk || ecdh.publicKeyJwk;
+
+            const { sharedKey, sharedKeyHash } = await deriveSharedAESGCMKey(
+              myPrivKey,
+              remotePubJwk
+            );
+
+            tunnel.sharedKey = sharedKey;
+            tunnel.remotePublicKeyJwk = remotePubJwk;
+            tunnel.sharedKeyHash = sharedKeyHash;
+            tunnel.remoteFingerprint = remoteFp;
+
+            // Update contact list to show ICE: CHECKING / HANDSHAKING immediately
+            setContacts((prev) => {
+              const list = [...prev];
+              const idx = list.findIndex(
+                (c) =>
+                  c.peerId === fromPeerId ||
+                  (!c.isGroup && c.nrp === fromNrp && c.provisionedByAdmin)
+              );
+              if (idx !== -1) {
+                list[idx] = {
+                  ...list[idx],
+                  peerId: fromPeerId,
+                  personnelName: fromCallsign || list[idx].personnelName,
+                  nrp: fromNrp,
+                  mode: 'live-peer',
+                  connectionState:
+                    tunnel?.dc?.readyState === 'open' ? 'CONNECTED' : 'HANDSHAKING',
+                  iceState: pc?.iceConnectionState === 'new' ? 'checking' : (pc?.iceConnectionState || 'checking'),
+                  dataChannelState: tunnel?.dc?.readyState || 'connecting',
+                  remoteFingerprint: remoteFp,
+                  sharedKeyHash,
+                };
+              } else {
+                list.unshift({
+                  peerId: fromPeerId,
+                  personnelName: fromCallsign,
+                  nrp: fromNrp,
+                  callsign: `${fromCallsign} [LIVE P2P]`,
+                  unit: 'SATKOM DISKOMLEKAU',
+                  rank: 'Personel Aktif',
+                  frequency: 'DIRECT WEBRTC P2P',
+                  sector: 'Multi-Client Live P2P',
+                  mode: 'live-peer',
+                  isGroup: false,
+                  avatarColor: 'from-cyan-400 to-teal-700',
+                  connectionState: 'HANDSHAKING',
+                  iceState: 'checking',
+                  dataChannelState: 'connecting',
+                  remoteFingerprint: remoteFp,
+                  sharedKeyHash,
+                  latencyMs: 6,
+                  unreadCount: 1,
+                  lastMessagePreview: `Auto-Dial masuk dari ${fromCallsign} (${fromPeerId})...`,
+                  lastActivityTime: Date.now(),
+                  provisionedByAdmin: true,
+                });
+              }
+              return list;
+            });
+
+            pc.ondatachannel = (dcEvent) => {
+              tunnel!.dc = dcEvent.channel;
+              setupLivePeerDataChannel(
+                fromPeerId,
+                fromCallsign,
+                fromNrp,
+                pc!,
+                dcEvent.channel,
+                sharedKey,
+                sharedKeyHash,
+                remoteFp
+              );
+            };
+
+            try {
+              if (pc.signalingState !== 'stable') {
+                await pc.setLocalDescription({ type: 'rollback' });
+              }
+              await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+              tunnel.isSettingRemoteDescription = false;
+
+              recordIceDiagnosticLog({
+                id: `SDP-RX-OFFER-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                timestamp: Date.now(),
+                peerId: fromPeerId,
+                peerName: fromCallsign,
+                category: 'SDP_HANDSHAKE',
+                iceConnectionState: pc.iceConnectionState,
+                iceGatheringState: pc.iceGatheringState,
+                signalingState: pc.signalingState,
+                dataChannelState: tunnel.dc?.readyState || 'connecting',
+                detail: `setRemoteDescription(SDP Offer${msg.iceRestart ? ' / ICE-Restart' : ''}) verified`,
+              });
+
+              // Immediately flush any remote ICE candidates that arrived while Offer was being processed
+              await flushPendingRemoteIceCandidates(tunnel, recordIceDiagnosticLog);
+
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+
+              // Wait for local STUN/TURN ICE candidates to gather into the SDP Answer
+              await waitForIceGatheringComplete(pc, 1100);
+
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'webrtc:answer',
+                    targetPeerId: fromPeerId,
+                    targetNrp: fromNrp,
+                    sdp: pc.localDescription || answer,
+                    publicKeyJwk: myPubJwk,
+                  })
+                );
 
                 recordIceDiagnosticLog({
-                  id: `SDP-RX-OFFER-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                  id: `SDP-TX-ANS-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
                   timestamp: Date.now(),
                   peerId: fromPeerId,
                   peerName: fromCallsign,
@@ -1976,135 +2065,147 @@ export default function App() {
                   iceGatheringState: pc.iceGatheringState,
                   signalingState: pc.signalingState,
                   dataChannelState: tunnel.dc?.readyState || 'connecting',
-                  detail: `setRemoteDescription(SDP Offer${msg.iceRestart ? ' / ICE-Restart' : ''}) verified`,
+                  detail: `setLocalDescription(SDP Answer) verified & transmitted (${tunnel.localCandidatesSent} ICE candidates)`,
+                });
+              }
+            } catch (err) {
+              tunnel.isSettingRemoteDescription = false;
+              console.warn('[SILENT LINK SDP] Error handling incoming Offer:', err);
+            }
+          }
+
+          if (msg.type === 'webrtc:answer' && msg.fromPeerId && msg.sdp && msg.publicKeyJwk) {
+            const fromPeerId: string = msg.fromPeerId;
+            const tunnel = livePeerTunnelsRef.current.get(fromPeerId);
+            const myPrivKey = localIdentityRef.current.privateKey || ecdh.privateKey;
+
+            if (tunnel && tunnel.pc) {
+              tunnel.isSettingRemoteDescription = true;
+              try {
+                const remoteFp = await computeJwkFingerprint(msg.publicKeyJwk);
+                const { sharedKey, sharedKeyHash } = await deriveSharedAESGCMKey(
+                  myPrivKey,
+                  msg.publicKeyJwk
+                );
+                tunnel.sharedKey = sharedKey;
+                tunnel.remotePublicKeyJwk = msg.publicKeyJwk;
+                tunnel.sharedKeyHash = sharedKeyHash;
+                tunnel.remoteFingerprint = remoteFp;
+
+                if (tunnel.pc.signalingState === 'have-local-offer') {
+                  await tunnel.pc.setRemoteDescription(
+                    new RTCSessionDescription(msg.sdp)
+                  );
+                }
+                tunnel.isSettingRemoteDescription = false;
+
+                recordIceDiagnosticLog({
+                  id: `SDP-RX-ANS-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                  timestamp: Date.now(),
+                  peerId: fromPeerId,
+                  peerName: tunnel.peerName,
+                  category: 'SDP_HANDSHAKE',
+                  iceConnectionState: tunnel.pc.iceConnectionState,
+                  iceGatheringState: tunnel.pc.iceGatheringState,
+                  signalingState: tunnel.pc.signalingState,
+                  dataChannelState: tunnel.dc?.readyState || 'connecting',
+                  detail: 'setRemoteDescription(SDP Answer) verified. Flushing ICE candidate queue...',
                 });
 
-                // Immediately flush any remote ICE candidates that arrived while Offer was being processed
+                // Flush any buffered remote ICE candidates immediately after setRemoteDescription
                 await flushPendingRemoteIceCandidates(tunnel, recordIceDiagnosticLog);
 
-                const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
-
-                // Wait for local ICE candidates to gather into the SDP Answer
-                await waitForIceGatheringComplete(pc, 800);
-
-                if (ws.readyState === WebSocket.OPEN) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'webrtc:answer',
-                      targetPeerId: fromPeerId,
-                      targetNrp: fromNrp,
-                      sdp: pc.localDescription || answer,
-                      publicKeyJwk: myPubJwk,
-                    })
-                  );
-
-                  recordIceDiagnosticLog({
-                    id: `SDP-TX-ANS-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                    timestamp: Date.now(),
-                    peerId: fromPeerId,
-                    peerName: fromCallsign,
-                    category: 'SDP_HANDSHAKE',
-                    iceConnectionState: pc.iceConnectionState,
-                    iceGatheringState: pc.iceGatheringState,
-                    signalingState: pc.signalingState,
-                    dataChannelState: tunnel.dc?.readyState || 'connecting',
-                    detail: `setLocalDescription(SDP Answer) verified & transmitted (${tunnel.localCandidatesSent} ICE candidates)`,
-                  });
-                }
+                setContacts((prev) =>
+                  prev.map((c) =>
+                    c.peerId === fromPeerId
+                      ? {
+                          ...c,
+                          mode: 'live-peer',
+                          connectionState:
+                            tunnel.dc?.readyState === 'open' ? 'CONNECTED' : 'HANDSHAKING',
+                          remoteFingerprint: remoteFp,
+                          sharedKeyHash,
+                        }
+                      : c
+                  )
+                );
               } catch (err) {
                 tunnel.isSettingRemoteDescription = false;
-                console.warn('[SILENT LINK SDP] Error handling incoming Offer:', err);
+                console.warn('[SILENT LINK SDP] Error applying SDP Answer:', err);
               }
             }
-
-            if (msg.type === 'webrtc:answer' && msg.fromPeerId && msg.sdp && msg.publicKeyJwk) {
-              const fromPeerId: string = msg.fromPeerId;
-              const tunnel = livePeerTunnelsRef.current.get(fromPeerId);
-              const myPrivKey = localIdentityRef.current.privateKey || ecdh.privateKey;
-
-              if (tunnel && tunnel.pc) {
-                tunnel.isSettingRemoteDescription = true;
-                try {
-                  const remoteFp = await computeJwkFingerprint(msg.publicKeyJwk);
-                  const { sharedKey, sharedKeyHash } = await deriveSharedAESGCMKey(
-                    myPrivKey,
-                    msg.publicKeyJwk
-                  );
-                  tunnel.sharedKey = sharedKey;
-                  tunnel.remotePublicKeyJwk = msg.publicKeyJwk;
-                  tunnel.sharedKeyHash = sharedKeyHash;
-                  tunnel.remoteFingerprint = remoteFp;
-
-                  if (tunnel.pc.signalingState === 'have-local-offer') {
-                    await tunnel.pc.setRemoteDescription(
-                      new RTCSessionDescription(msg.sdp)
-                    );
-                  }
-                  tunnel.isSettingRemoteDescription = false;
-
-                  recordIceDiagnosticLog({
-                    id: `SDP-RX-ANS-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                    timestamp: Date.now(),
-                    peerId: fromPeerId,
-                    peerName: tunnel.peerName,
-                    category: 'SDP_HANDSHAKE',
-                    iceConnectionState: tunnel.pc.iceConnectionState,
-                    iceGatheringState: tunnel.pc.iceGatheringState,
-                    signalingState: tunnel.pc.signalingState,
-                    dataChannelState: tunnel.dc?.readyState || 'connecting',
-                    detail: 'setRemoteDescription(SDP Answer) verified. Flushing ICE candidate queue...',
-                  });
-
-                  // Flush any buffered remote ICE candidates immediately after setRemoteDescription
-                  await flushPendingRemoteIceCandidates(tunnel, recordIceDiagnosticLog);
-
-                  setContacts((prev) =>
-                    prev.map((c) =>
-                      c.peerId === fromPeerId
-                        ? {
-                            ...c,
-                            mode: 'live-peer',
-                            connectionState: 'CONNECTED',
-                            remoteFingerprint: remoteFp,
-                            sharedKeyHash,
-                          }
-                        : c
-                    )
-                  );
-                } catch (err) {
-                  tunnel.isSettingRemoteDescription = false;
-                  console.warn('[SILENT LINK SDP] Error applying SDP Answer:', err);
-                }
-              }
-            }
-
-            if (msg.type === 'webrtc:ice-candidate' && msg.fromPeerId && msg.candidate) {
-              const fromPeerId: string = msg.fromPeerId;
-              let tunnel = livePeerTunnelsRef.current.get(fromPeerId);
-              if (!tunnel) {
-                tunnel = createEmptyLivePeerTunnel(fromPeerId);
-                livePeerTunnelsRef.current.set(fromPeerId, tunnel);
-              }
-              await addOrQueueRemoteIceCandidate(
-                tunnel,
-                msg.candidate,
-                recordIceDiagnosticLog
-              );
-            }
-          } catch {
-            // Ignore malformed WS packet
           }
-        };
+
+          if (msg.type === 'webrtc:ice-candidate' && msg.fromPeerId && msg.candidate) {
+            const fromPeerId: string = msg.fromPeerId;
+            let tunnel = livePeerTunnelsRef.current.get(fromPeerId);
+            if (!tunnel) {
+              tunnel = createEmptyLivePeerTunnel(fromPeerId);
+              livePeerTunnelsRef.current.set(fromPeerId, tunnel);
+            }
+            await addOrQueueRemoteIceCandidate(
+              tunnel,
+              msg.candidate,
+              recordIceDiagnosticLog
+            );
+          }
+        } catch {
+          // Ignore malformed signaling packet
+        }
       };
 
-      connectSignalingWebSocket();
+      // 2. Check if launched via Admin-generated QR Code Link (?join=SLK-ID-... or ?invite=SLK-ID-...) or Encrypted Deep Link (?silentlink_token=SLK2...)
+      const params = new URLSearchParams(window.location.search);
+      const joinOrInviteParam = params.get('join') || params.get('invite');
+      const deepLinkToken = params.get('silentlink_token');
+      if (joinOrInviteParam || deepLinkToken) {
+        try {
+          const verifiedCred = await verifyAndParseProvisioningToken(
+            joinOrInviteParam ? window.location.href : deepLinkToken!
+          );
+          window.history.replaceState({}, document.title, window.location.pathname);
+          await handleCompleteOperativeOnboarding(verifiedCred);
+        } catch {
+          // Continue normal initialization if invalid
+        }
+      } else {
+        // Register initial Master Admin identity on signaling bus & pre-connect preset loopback demo contact
+        sendNodeRegistration(initialAdminIdentity);
+        const firstContact = INITIAL_TACTICAL_CONTACTS[0];
+        await establishLoopbackWebRTCTunnel(firstContact, {
+          privateKey: ecdh.privateKey,
+          publicKeyJwk: ecdh.publicKeyJwk,
+          fingerprint: ecdh.fingerprint,
+        });
+      }
+
+      // 3. Background Auto-Dial Retry Watchdog for pending QR/Link cross-device connections
+      autoDialInterval = window.setInterval(() => {
+        if (!isMounted || wsRef.current?.readyState !== WebSocket.OPEN) return;
+        const target = pendingAutoDialPeerRef.current;
+        if (target) {
+          const t = livePeerTunnelsRef.current.get(target.peerId);
+          if (t?.dc?.readyState === 'open') {
+            pendingAutoDialPeerRef.current = null;
+          } else if (
+            !t?.makingOffer &&
+            (!t?.pc ||
+              t.pc.iceConnectionState === 'failed' ||
+              t.pc.iceConnectionState === 'disconnected' ||
+              t.pc.iceConnectionState === 'closed' ||
+              t.pc.signalingState === 'stable')
+          ) {
+            sendNodeRegistration(localIdentityRef.current);
+            initiateLiveWebRTCOffer(target.peerId, target.callsign, target.nrp);
+          }
+        }
+      }, 4500);
     };
 
     initSystem();
 
     const handleUnload = () => {
-      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (autoDialInterval) window.clearInterval(autoDialInterval);
       loopbackTunnelsRef.current.forEach((t) => {
         t.localDc.close();
         t.localPc.close();
@@ -2121,7 +2222,7 @@ export default function App() {
     window.addEventListener('beforeunload', handleUnload);
     return () => {
       isMounted = false;
-      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (autoDialInterval) window.clearInterval(autoDialInterval);
       window.removeEventListener('beforeunload', handleUnload);
       handleUnload();
     };
@@ -2144,6 +2245,10 @@ export default function App() {
   ) => {
     setIssuedCredentials((prev) => [cred, ...prev]);
 
+    // Publish retained invite credential to Cross-Device MQTT WSS Broker so scanning smartphone syncs immediately
+    wsRef.current?.publishRetainedInvite(cred);
+    sendNodeRegistration(localIdentityRef.current);
+
     recordPacketLog(
       'PROVISION',
       `${cred.personnelName} (${cred.nrp})`,
@@ -2153,7 +2258,16 @@ export default function App() {
     );
 
     if (deployLocalLoopback && localIdentity.privateKey && localIdentity.publicKeyJwk) {
-      const alreadyLive = livePeerTunnelsRef.current.has(cred.assignedPeerId);
+      let existingTunnel = livePeerTunnelsRef.current.get(cred.assignedPeerId);
+      if (!existingTunnel) {
+        existingTunnel = createEmptyLivePeerTunnel(
+          cred.assignedPeerId,
+          cred.personnelName,
+          cred.nrp
+        );
+        livePeerTunnelsRef.current.set(cred.assignedPeerId, existingTunnel);
+      }
+      const isAlreadyOpen = existingTunnel.dc?.readyState === 'open';
 
       const newOperativeContact: TacticalContact = {
         peerId: cred.assignedPeerId,
@@ -2162,19 +2276,19 @@ export default function App() {
         callsign: `${cred.personnelName} [NRP:${cred.nrp}]`,
         unit: cred.unit,
         rank: cred.rank,
-        frequency: 'PROVISIONED QR P2P',
+        frequency: 'CROSS-DEVICE WEBRTC P2P',
         sector: 'Verified Operative',
-        mode: alreadyLive ? 'live-peer' : 'loopback-webrtc',
+        mode: 'live-peer',
         isGroup: false,
         avatarColor: 'from-cyan-500 to-teal-700',
-        connectionState: alreadyLive ? 'CONNECTED' : 'DISCONNECTED',
-        iceState: alreadyLive ? 'connected' : 'new',
-        dataChannelState: alreadyLive ? 'open' : 'closed',
-        remoteFingerprint: 'MENUNGGU SCAN QR PERSONEL...',
-        sharedKeyHash: 'MENUNGGU ECDH...',
+        connectionState: isAlreadyOpen ? 'CONNECTED' : 'HANDSHAKING',
+        iceState: isAlreadyOpen ? 'connected' : 'checking',
+        dataChannelState: isAlreadyOpen ? 'open' : 'connecting',
+        remoteFingerprint: 'MENUNGGU AUTO-DIAL QR PERSONEL...',
+        sharedKeyHash: 'SIAP ECDH P-256...',
         latencyMs: 0,
         unreadCount: 1,
-        lastMessagePreview: `QR & ID ${cred.assignedPeerId} diterbitkan. Otomatis tersambung saat QR dipindai.`,
+        lastMessagePreview: `QR & Link (?join=${cred.assignedPeerId}) siap. Otomatis tersambung P2P saat dipindai.`,
         lastActivityTime: Date.now(),
         provisionedByAdmin: true,
         autoResponderProfile: 'field',
@@ -2402,31 +2516,21 @@ export default function App() {
 
       const serializedPacket = JSON.stringify(packet);
 
-      // 1. Transmit over WebRTC DataChannel (strictly checks readyState === 'open', otherwise queues in FIFO for dc.onopen)
+      // 1. Transmit 100% directly over WebRTC DataChannel (ordered:true, reliable:true).
+      // Once DataChannel is 'open', zero packets pass through the signaling broker.
+      // If DataChannel is still handshaking, packet is queued in FIFO and flushed directly over DataChannel on open.
       const dcResult = sendOverReliableDataChannel(
         liveTunnel,
         serializedPacket,
         recordIceDiagnosticLog
       );
 
-      // If DataChannel is not yet open, trigger Offer/ICE negotiation so the queued packet flushes on open
+      // If DataChannel is not yet open, trigger Offer/ICE negotiation so the queued packet flushes over DataChannel on open
       if (!dcResult.sentImmediately) {
         initiateLiveWebRTCOffer(
           activeContact.peerId,
           activeContact.personnelName,
           activeContact.nrp
-        );
-      }
-
-      // 2. Also transmit E2EE ciphertext via WebSocket signaling relay so cross-NAT mobile 4G delivery is 100% instant
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'e2ee:packet',
-            targetPeerId: activeContact.peerId,
-            targetNrp: activeContact.nrp,
-            packet,
-          })
         );
       }
 
@@ -2443,10 +2547,10 @@ export default function App() {
         ivHex: envelope.ivHex,
         sha256Hash: envelope.sha256Hash,
         byteLength: envelope.byteLength,
-        status: 'SENT',
+        status: dcResult.sentImmediately ? 'DELIVERED' : 'SENT',
         transport: dcResult.sentImmediately
-          ? 'WebRTC DataChannel (ordered:true, reliable:true)'
-          : 'WebRTC P2P E2EE (Queued/Synced)',
+          ? '100% Direct P2P WebRTC DataChannel (Zero Broker)'
+          : 'WebRTC DataChannel Queue (Flushes on Open)',
         fileMeta,
         voiceMeta,
       };
@@ -3170,11 +3274,11 @@ export default function App() {
           </div>
 
           <span
-            className="text-[9px] tracking-widest uppercase truncate px-2"
-            style={{ color: 'var(--slk-text-secondary)' }}
+            className="text-[9px] tracking-widest uppercase truncate px-2 font-mono"
+            style={{ color: wsSignalConnected ? 'var(--slk-accent)' : '#fbbf24' }}
           >
-            {MILITARY_THEMES[activeTheme].badgeText} •{' '}
-            {keepAliveStatus.enabled ? 'BG-DAEMON ON' : 'P2P E2EE'}
+            SIGNALING: {wsSignalConnected ? 'ONLINE' : 'CONNECTING'} •{' '}
+            {MILITARY_THEMES[activeTheme].badgeText}
           </span>
 
           {/* Pojok Kanan Atas: Logo TNI AU Super Kecil */}
@@ -3302,22 +3406,89 @@ export default function App() {
               </div>
             </header>
 
-            {/* Single Thin Encryption & Live ICE/DataChannel Strip at Top of Chat Room */}
+            {/* Real-Time Connection Diagnostic Bar: SIGNALING: ONLINE -> ICE: CHECKING -> P2P E2EE: CONNECTED */}
             <div
               onClick={() => setShowSecuritySheet(true)}
-              className="py-1.5 px-3 border-b text-center cursor-pointer transition-colors z-10"
+              className="py-1.5 px-2.5 border-b flex items-center justify-between gap-2 cursor-pointer transition-colors z-10 overflow-x-auto"
               style={{
                 backgroundColor: 'var(--slk-bg-card)',
                 borderColor: 'var(--slk-border)',
               }}
             >
-              <p
-                className="text-[11px] font-medium tracking-wide truncate"
-                style={{ color: 'var(--slk-accent)' }}
-              >
-                🔒 E2EE AES-256-GCM • ICE: {activeContact.iceState.toUpperCase()} • DC:{' '}
-                {activeContact.dataChannelState.toUpperCase()} (ordered/reliable) • ZERO-RETENTION
-              </p>
+              <div className="flex items-center gap-1.5 text-[10px] sm:text-[11px] font-mono font-semibold whitespace-nowrap mx-auto">
+                {/* Stage 1: SIGNALING */}
+                <span
+                  className={`px-2 py-0.5 rounded border ${
+                    wsSignalConnected
+                      ? 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300'
+                      : 'bg-amber-950/70 border-amber-500/40 text-amber-300'
+                  }`}
+                >
+                  SIGNALING: {wsSignalConnected ? 'ONLINE' : 'CONNECTING'}
+                </span>
+
+                <span className="text-slate-500">-&gt;</span>
+
+                {/* Stage 2: ICE */}
+                <span
+                  className={`px-2 py-0.5 rounded border ${
+                    activeContact.dataChannelState === 'open' ||
+                    activeContact.iceState === 'connected' ||
+                    activeContact.iceState === 'completed'
+                      ? 'bg-cyan-950/70 border-cyan-500/40 text-cyan-300'
+                      : 'bg-amber-950/70 border-amber-500/40 text-amber-300 animate-pulse'
+                  }`}
+                >
+                  ICE:{' '}
+                  {activeContact.dataChannelState === 'open' ||
+                  activeContact.iceState === 'connected' ||
+                  activeContact.iceState === 'completed'
+                    ? 'CONNECTED'
+                    : activeContact.iceState === 'failed' ||
+                      activeContact.iceState === 'disconnected'
+                    ? 'RESTARTING'
+                    : 'CHECKING'}
+                </span>
+
+                <span className="text-slate-500">-&gt;</span>
+
+                {/* Stage 3: P2P E2EE */}
+                <span
+                  className={`px-2 py-0.5 rounded border ${
+                    activeContact.dataChannelState === 'open' ||
+                    activeContact.connectionState === 'CONNECTED'
+                      ? 'bg-emerald-950/80 border-emerald-400/50 text-emerald-300'
+                      : 'bg-slate-900 border-slate-700 text-amber-300'
+                  }`}
+                >
+                  P2P E2EE:{' '}
+                  {activeContact.dataChannelState === 'open' ||
+                  activeContact.connectionState === 'CONNECTED'
+                    ? 'CONNECTED'
+                    : 'CHECKING'}
+                </span>
+              </div>
+
+              {activeContact.mode === 'live-peer' &&
+                activeContact.dataChannelState !== 'open' && (
+                  <button
+                    type="button"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      sendNodeRegistration(localIdentityRef.current);
+                      initiateLiveWebRTCOffer(
+                        activeContact.peerId,
+                        activeContact.personnelName,
+                        activeContact.nrp,
+                        true
+                      );
+                    }}
+                    className="px-2 py-0.5 rounded bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-[10px] font-mono font-bold text-cyan-300 shrink-0"
+                    title="Auto-Dial Ulang ke ID Target"
+                  >
+                    DIAL P2P
+                  </button>
+                )}
             </div>
 
             {/* Chat Messages Scrollable Area */}

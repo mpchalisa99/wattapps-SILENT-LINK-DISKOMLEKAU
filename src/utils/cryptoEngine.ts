@@ -3,6 +3,7 @@
 // Strictly volatile in-memory key management (Zero-Data Retention)
 
 import { ProvisionedOperativeCredential } from '../types/tactical';
+import { getCachedBrokerInvite } from './crossDeviceSignaling';
 
 export interface EncryptedEnvelope {
   ciphertextB64: string;
@@ -325,14 +326,14 @@ export async function generateSignedProvisioningCredential(params: {
   const encryptedToken = `SLK2.${toBase64Url(JSON.stringify(bundle))}`;
   const originUrl = `${window.location.origin}${window.location.pathname}`;
 
-  // Compact, low-density QR Deep Link URL carrying Admin's real ECDH P-256 public key coordinates (ax, ay)
+  // Compact, low-density QR Deep Link URL carrying target Signaling ID (?join=SLK-ID-...), Admin Signaling ID (apid), and Admin ECDH P-256 public key coordinates (ax, ay)
   const compactQuery = new URLSearchParams({
-    invite: assignedPeerId,
+    join: assignedPeerId,
+    apid: params.adminPeerId,
     n: cleanName,
     nrp: cleanNrp,
     r: cleanRank,
     u: cleanUnit,
-    apid: params.adminPeerId,
     ...(params.adminPublicKeyJwk.x ? { ax: params.adminPublicKeyJwk.x } : {}),
     ...(params.adminPublicKeyJwk.y ? { ay: params.adminPublicKeyJwk.y } : {}),
   });
@@ -360,14 +361,16 @@ export async function generateSignedProvisioningCredential(params: {
   localRamInviteRegistry.set(assignedPeerId.toUpperCase(), credentialObj);
   localRamInviteRegistry.set(credentialId.toUpperCase(), credentialObj);
 
-  try {
-    await fetch('/api/invite', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(credentialObj),
-    });
-  } catch {
-    // Offline / air-gapped fallback uses URL query params or SLK2 token directly
+  if (typeof window !== 'undefined' && !window.location.hostname.endsWith('.vercel.app')) {
+    try {
+      await fetch('/api/invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credentialObj),
+      });
+    } catch {
+      // Serverless / Vercel uses URL query params + MQTT WSS retained topic directly
+    }
   }
 
   return credentialObj;
@@ -417,7 +420,7 @@ async function verifyCredentialSignature(cred: ProvisionedOperativeCredential): 
 
 // Operative Client Onboarding Parser & ECDSA Signature Verifier
 // Supports:
-// 1. Compact QR Code Deep Links (?invite=SLK-ID-...&n=...&nrp=...&ax=...&ay=...)
+// 1. Compact QR Code Deep Links (?join=SLK-ID-... or ?invite=SLK-ID-...&apid=...&ax=...&ay=...)
 // 2. 1D Code-128B Barcode strings (SLK-ID-... or *SLK-ID-...*)
 // 3. Full SLK2 Base64URL tokens (SLK2.... or ?silentlink_token=SLK2....)
 export async function verifyAndParseProvisioningToken(
@@ -425,20 +428,20 @@ export async function verifyAndParseProvisioningToken(
 ): Promise<ProvisionedOperativeCredential> {
   const trimmed = rawInput.trim().replace(/^\*+|\*+$/g, '');
 
-  // Case 1: Compact QR Code Deep Link (?invite=SLK-ID-...) or Raw Personnel ID (SLK-ID-...)
+  // Case 1: Compact QR Code Deep Link (?join=SLK-ID-... or ?invite=SLK-ID-...) or Raw Personnel ID (SLK-ID-...)
   let inviteId: string | null = null;
   let urlParams: URLSearchParams | null = null;
 
-  if (trimmed.includes('invite=')) {
+  if (trimmed.includes('join=') || trimmed.includes('invite=')) {
     try {
       const urlObj = new URL(trimmed, window.location.origin);
       urlParams = urlObj.searchParams;
-      inviteId = urlParams.get('invite');
+      inviteId = urlParams.get('join') || urlParams.get('invite');
     } catch {
       const qIndex = trimmed.indexOf('?');
       if (qIndex !== -1) {
         urlParams = new URLSearchParams(trimmed.slice(qIndex + 1));
-        inviteId = urlParams.get('invite');
+        inviteId = urlParams.get('join') || urlParams.get('invite');
       }
     }
   } else if (
@@ -449,16 +452,22 @@ export async function verifyAndParseProvisioningToken(
     inviteId = trimmed.toUpperCase();
   }
 
+  // Also check if ?join= contained an SLK2 token directly
+  if (inviteId && inviteId.startsWith('SLK2.')) {
+    return verifyAndParseProvisioningToken(inviteId);
+  }
+
   if (inviteId) {
     const cleanInviteId = inviteId.trim().toUpperCase();
 
-    // 1A: Check local RAM registry first
-    const localFound = localRamInviteRegistry.get(cleanInviteId);
+    // 1A: Check local RAM registry or MQTT Retained Broker Invite Cache first
+    const localFound =
+      localRamInviteRegistry.get(cleanInviteId) || getCachedBrokerInvite(cleanInviteId);
     if (localFound) {
       return localFound;
     }
 
-    // 1B: Check volatile Server RAM (/api/invite/:id) for cross-device smartphone scan
+    // 1B: Check volatile Server RAM (/api/invite/:id) if not on static Vercel
     let partialAdminFromServer: {
       adminPeerId?: string;
       adminCallsign?: string;
@@ -466,24 +475,26 @@ export async function verifyAndParseProvisioningToken(
       adminFingerprint?: string;
     } | null = null;
 
-    try {
-      const resp = await fetch(`/api/invite/${encodeURIComponent(cleanInviteId)}`);
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data && data.credential) {
-          const serverCred = data.credential as ProvisionedOperativeCredential;
-          await verifyCredentialSignature(serverCred);
-          return serverCred;
+    if (typeof window !== 'undefined' && !window.location.hostname.endsWith('.vercel.app')) {
+      try {
+        const resp = await fetch(`/api/invite/${encodeURIComponent(cleanInviteId)}`);
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data && data.credential) {
+            const serverCred = data.credential as ProvisionedOperativeCredential;
+            await verifyCredentialSignature(serverCred);
+            return serverCred;
+          }
+          if (data && data.partialAdmin) {
+            partialAdminFromServer = data.partialAdmin;
+          }
         }
-        if (data && data.partialAdmin) {
-          partialAdminFromServer = data.partialAdmin;
-        }
+      } catch {
+        // Serverless / Vercel uses URL parameter reconstruction + MQTT WSS dynamic ECDH
       }
-    } catch {
-      // Server unreachable or offline scan — fall back to URL parameter reconstruction
     }
 
-    // 1C: Reconstruct credential from URL query params (including embedded ECDH ax, ay coordinates) or active server Admin
+    // 1C: Reconstruct credential from URL query params (including embedded ECDH ax, ay coordinates & apid target Admin ID)
     const axParam = urlParams?.get('ax');
     const ayParam = urlParams?.get('ay');
     let embeddedAdminPubJwk: JsonWebKey | null = null;
@@ -535,7 +546,7 @@ export async function verifyAndParseProvisioningToken(
       issuedAt: Date.now(),
       signatureHex: 'ECDSA-P256-QR-VERIFIED',
       encryptedToken: cleanInviteId,
-      deepLinkUrl: `${originUrl}?invite=${encodeURIComponent(cleanInviteId)}&n=${encodeURIComponent(personnelName)}&nrp=${encodeURIComponent(nrp)}&r=${encodeURIComponent(rank)}&u=${encodeURIComponent(unit)}&apid=${encodeURIComponent(adminPeerId)}`,
+      deepLinkUrl: `${originUrl}?join=${encodeURIComponent(cleanInviteId)}&apid=${encodeURIComponent(adminPeerId)}&n=${encodeURIComponent(personnelName)}&nrp=${encodeURIComponent(nrp)}&r=${encodeURIComponent(rank)}&u=${encodeURIComponent(unit)}`,
     };
   }
 

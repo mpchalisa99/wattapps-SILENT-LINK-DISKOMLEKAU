@@ -17,6 +17,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { TacticalContact } from '../types/tactical';
+import { TACTICAL_ICE_CONFIG } from '../utils/webrtcPeerEngine';
 
 export interface LiveCallSignalPacket {
   type:
@@ -44,18 +45,12 @@ interface TacticalMediaStreamModalProps {
   contact: TacticalContact | null;
   localPeerId: string;
   localCallsign: string;
-  wsRef: React.MutableRefObject<WebSocket | null>;
+  wsRef: React.MutableRefObject<{ readyState: number; send: (data: string) => void } | null>;
   latestCallSignal: LiveCallSignalPacket | null;
   onClose: (notifyRemote?: boolean) => void;
 }
 
-const RTC_ICE_CONFIG: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-  ],
-};
+const RTC_ICE_CONFIG: RTCConfiguration = TACTICAL_ICE_CONFIG;
 
 export const TacticalMediaStreamModal: React.FC<TacticalMediaStreamModalProps> = ({
   isOpen,
